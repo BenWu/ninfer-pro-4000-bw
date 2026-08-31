@@ -54,6 +54,50 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     if (cache.storage == KvCacheStorage::Int8Group64) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
+        if (cache.k_e8_root || cache.k_packed_i4) {
+            // E8 code planes (RK4V4E8: packed-4-bit lattice K, RK2V4E8: E8 root-cylinder K) are U8;
+            // both keep the per-group FP16 K/V scales and H64-rotate K and V before quantization.
+            constexpr int TokensPerTile = 8;
+            constexpr int FillWarps     = kBlock / 32;
+            const bool page             = tokens >= 128 && Geometry::KVHeads == 2;
+            const auto fill = [&]<bool E8Lattice, bool E8Root>() {
+                if (page) {
+                    const int max_tiles = div_up(tokens + TokensPerTile - 1, TokensPerTile);
+                    const dim3 g(static_cast<unsigned>(max_tiles),
+                                 static_cast<unsigned>(Geometry::KVHeads));
+                    kv_cache_append_full_e8_page_kernel<Geometry, E8Lattice, E8Root, Metadata>
+                        <<<g, kBlock, 0, stream>>>(
+                            static_cast<const __nv_bfloat16*>(k.data),
+                            static_cast<const __nv_bfloat16*>(v.data),
+                            static_cast<const std::int32_t*>(positions.data), metadata,
+                            static_cast<std::uint8_t*>(cache_k.data),
+                            static_cast<std::uint8_t*>(cache_v.data),
+                            static_cast<__half*>(cache_k_scale.data),
+                            static_cast<__half*>(cache_v_scale.data), tokens);
+                } else {
+                    const std::int64_t fill_units = static_cast<std::int64_t>(tokens) *
+                                                    Geometry::KVHeads;
+                    const int fill_grid =
+                        static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+                    kv_cache_append_full_e8_kernel<Geometry, E8Lattice, E8Root, Metadata>
+                        <<<fill_grid, kBlock, 0, stream>>>(
+                            static_cast<const __nv_bfloat16*>(k.data),
+                            static_cast<const __nv_bfloat16*>(v.data),
+                            static_cast<const std::int32_t*>(positions.data), metadata,
+                            static_cast<std::uint8_t*>(cache_k.data),
+                            static_cast<std::uint8_t*>(cache_v.data),
+                            static_cast<__half*>(cache_k_scale.data),
+                            static_cast<__half*>(cache_v_scale.data), tokens);
+                }
+            };
+            if (cache.k_e8_root) {
+                fill.template operator()<false, true>();
+            } else {
+                fill.template operator()<true, false>();
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         if (tokens >= 128 && Geometry::KVHeads == 2) {
             constexpr int TokensPerTile = 8;
             const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);

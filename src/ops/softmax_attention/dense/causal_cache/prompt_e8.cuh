@@ -18,37 +18,19 @@
 #include "ops/kv_cache/e8_root_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
+// Shared prompt-I8 layout constants and swizzle helpers (store_swz, p_swz, dequant_f16x8) live in
+// prompt_i8.cuh; this E8 kernel reuses them and adds only the E8 smem sizing and decode helpers.
+#include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
 
 #include <cstdint>
 
 namespace ninfer::ops {
 
-inline constexpr int kCausalPromptI8Warps      = 16;
-inline constexpr int kCausalPromptI8Threads    = kCausalPromptI8Warps * 32;
-inline constexpr int kCausalPromptI8Br         = 64;
-inline constexpr int kCausalPromptI8Bc         = 64;
-inline constexpr int kCausalPromptI8Groups     = kCausalPromptHeadDim / kKVCacheInt8Group;
-inline constexpr int kCausalPromptI8DB16       = kCausalPromptHeadDim / 2;
-inline constexpr int kCausalPromptI8RowTiles   = kCausalPromptI8Br / 16;
-inline constexpr int kCausalPromptI8DConsumers = kCausalPromptI8Warps / kCausalPromptI8RowTiles;
-
-inline constexpr int kCausalPromptI8QBytes = kCausalPromptI8Br * kCausalPromptHeadDim;
-inline constexpr int kCausalPromptI8QScaleBytes =
-    kCausalPromptI8Br * kCausalPromptI8Groups * static_cast<int>(sizeof(float));
-inline constexpr int kCausalPromptI8KBytes = kCausalPromptI8Bc * kCausalPromptHeadDim;
 template <bool E8Root>
 inline constexpr int kCausalPromptE8KeyRawBytes =
     kCausalPromptI8Bc * (E8Root ? kCausalPromptHeadDim / 4 : kCausalPromptHeadDim / 2);
 inline constexpr int kCausalPromptE8ValueRawBytes =
     kCausalPromptI8Bc * (kCausalPromptHeadDim / 2);
-inline constexpr int kCausalPromptI8VStageBytes =
-    kCausalPromptI8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
-inline constexpr int kCausalPromptI8PBytes =
-    kCausalPromptI8Br * kCausalPromptI8Bc * static_cast<int>(sizeof(__half));
-inline constexpr int kCausalPromptI8ScaleBytes =
-    2 * kCausalPromptI8Bc * kCausalPromptI8Groups * static_cast<int>(sizeof(__half));
-inline constexpr int kCausalPromptI8StatsBytes =
-    2 * kCausalPromptI8Br * static_cast<int>(sizeof(float));
 // The packed-code staging replaces the INT8 V code arena, so the RK4V4E8 variant keeps the exact
 // INT8 budget; the RK2V4E8 key arena is half-sized and the kernel uses 4 KiB less.
 template <bool E8Root>
@@ -61,36 +43,6 @@ static_assert(kCausalPromptI8Groups == 4);
 static_assert(kCausalPromptI8DConsumers == 4);
 static_assert(kCausalPromptE8SmemBytes<false> == 92672);
 static_assert(kCausalPromptE8SmemBytes<true> == 88576);
-
-__device__ __forceinline__ void causal_prompt_i8_store_swz(std::int8_t* tile, int row, int d,
-                                                           std::int8_t code) {
-    const int col_b16 = d >> 1;
-    const int byte    = d & 1;
-    const int off     = (row * kCausalPromptI8DB16 + causal_prompt_swz(row, col_b16)) * 2 + byte;
-    tile[off]         = code;
-}
-
-__device__ __forceinline__ int causal_prompt_i8_p_swz(int row, int col) {
-    if constexpr (kCausalPromptI8Bc == 32) { return (((col >> 3) ^ (row & 3)) << 3) | (col & 7); }
-    return causal_prompt_swz(row, col);
-}
-
-__device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t* codes8,
-                                                               __half scale) {
-    const int2 raw       = load_vec<int2>(codes8);
-    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
-    const __half2 s2     = __halves2half2(scale, scale);
-    unsigned packed[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const __half2 code2 =
-            __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
-        const __half2 value2 = __hmul2(code2, s2);
-        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
-    }
-    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
-                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
-}
 
 // Decode one 8-byte packed-4-bit key chunk (16 rotated dimensions, inside one G64 group) into
 // the swizzled INT8 QK arena.
@@ -107,30 +59,23 @@ __device__ __forceinline__ void causal_prompt_e8_decode_packed_k16(const std::ui
 }
 
 // Decode one 16-byte E8 root key chunk (one 64-dimension group: eight 8-dimension blocks) into
-// the swizzled INT8 QK arena; the packed variant decodes four 8-byte chunks instead.
+// the swizzled INT8 QK arena. The packed variant decodes four 8-byte chunks instead (producer
+// handles it directly). Each 8-dimension block stores a consecutive (root, rad) byte pair, matching
+// kv_cache_append_e8_group.
 template <bool E8Root>
 __device__ __forceinline__ void causal_prompt_e8_decode_key_group(const std::uint8_t* raw16,
                                                                  std::int8_t* k_tile, int row,
                                                                  int d) {
     if constexpr (E8Root) {
-        const std::uint64_t lo = load_vec<std::uint64_t>(raw16);
-        const std::uint64_t hi = load_vec<std::uint64_t>(raw16 + 8);
-        const auto* c1 = reinterpret_cast<const std::uint8_t*>(&lo);
-        const auto* c2 = reinterpret_cast<const std::uint8_t*>(&hi);
 #pragma unroll
         for (int b = 0; b < 8; ++b) {
             std::int8_t dec[8];
-            e8_root_decode_8d_fast(c1[b], c2[b], dec);
+            e8_root_decode_8d_fast(raw16[2 * b], raw16[2 * b + 1], dec);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 causal_prompt_i8_store_swz(k_tile, row, d + 8 * b + i, dec[i]);
             }
         }
-    } else {
-        causal_prompt_e8_decode_packed_k16(raw16, k_tile, row, d);
-        causal_prompt_e8_decode_packed_k16(raw16 + 8, k_tile, row, d + 16);
-        causal_prompt_e8_decode_packed_k16(raw16 + 16, k_tile, row, d + 32);
-        causal_prompt_e8_decode_packed_k16(raw16 + 24, k_tile, row, d + 48);
     }
 }
 
@@ -212,7 +157,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_e8_kernel(
                     __bfloat162float(q[causal_prompt_q_index<Geometry>(q_head, d, q0 + row)]);
             }
         }
-        normalized_hadamard_d256_inplace(q_values, lane);
+        // E8 Q is H64-rotated per 64-dimension group only (matching the H64-rotated E8 K cache),
+        // not the D256 prepass the INT8 path applies.
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
             kv_cache_hadamard64(q_values[2 * grp], q_values[2 * grp + 1], FullMask);

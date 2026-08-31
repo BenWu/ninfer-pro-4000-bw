@@ -5,6 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
+#include "ops/softmax_attention/dense/causal_cache/prompt_e8.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
 
@@ -31,11 +32,55 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     CUDA_CHECK(attr_i8);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
-    if (cache.storage == KvCacheStorage::Int8Group64) {
+    if (cache.storage == KvCacheStorage::Int8Group64 ||
+        cache.storage == KvCacheStorage::RK4V4E8 || cache.storage == KvCacheStorage::RK2V4E8) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
+        if (cache.storage == KvCacheStorage::RK4V4E8 ||
+            cache.storage == KvCacheStorage::RK2V4E8) {
+            // E8 code planes are U8; the key plane encoding selects the kernel variant.
+            if (cache.storage == KvCacheStorage::RK2V4E8) {
+                static const cudaError_t attr_e8 =
+                    cudaFuncSetAttribute(causal_attention_prompt_e8_kernel<Geometry, true, Metadata>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         kCausalPromptE8SmemBytes<true>);
+                CUDA_CHECK(attr_e8);
+                causal_attention_prompt_e8_kernel<Geometry, true, Metadata>
+                    <<<attention_grid, kCausalPromptI8Threads, kCausalPromptE8SmemBytes<true>, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::uint8_t*>(cache_k.data),
+                    static_cast<const std::uint8_t*>(cache_v.data),
+                    static_cast<const __half*>(cache_k_scale.data),
+                    static_cast<const __half*>(cache_v_scale.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            } else {
+                static const cudaError_t attr_e8 =
+                    cudaFuncSetAttribute(causal_attention_prompt_e8_kernel<Geometry, false, Metadata>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         kCausalPromptE8SmemBytes<false>);
+                CUDA_CHECK(attr_e8);
+                causal_attention_prompt_e8_kernel<Geometry, false, Metadata>
+                    <<<attention_grid, kCausalPromptI8Threads, kCausalPromptE8SmemBytes<false>, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::uint8_t*>(cache_k.data),
+                    static_cast<const std::uint8_t*>(cache_v.data),
+                    static_cast<const __half*>(cache_k_scale.data),
+                    static_cast<const __half*>(cache_v_scale.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            // Both E8 modes rotate V, so the PV result is always in H64-rotated value space.
+            const int units = tokens * Geometry::QHeads * kKVCacheInt8Groups;
+            kv_cache_inverse_rotate_output_kernel<Geometry::QHeads><<<units, 32, 0, stream>>>(
+                static_cast<__nv_bfloat16*>(out.data), tokens, tokens, 0, nullptr);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+
         causal_attention_prompt_i8_kernel<Geometry, Metadata>
             <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),

@@ -1,5 +1,6 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -399,31 +400,149 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     return failures;
 }
 
-int verify_workspace_capacity_contract(const Geometry& geometry,
-                                       std::initializer_list<std::int32_t> route_endpoints) {
-    const std::int32_t last = *std::max_element(route_endpoints.begin(), route_endpoints.end());
+int verify_workspace_capacity_contract(const Geometry& geometry, std::int32_t last) {
+    // The interval query must cover every T in [1, last]; under device-dependent schedule
+    // demotion the workspace peak can sit at an interior demotion boundary, so sweep the whole
+    // interval rather than a fixed endpoint set.
     const std::size_t interval =
         ops::gdn_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, last);
     std::size_t witness = 0;
-    for (const std::int32_t tokens : route_endpoints) {
-        witness = std::max(witness, ops::gdn_gating_proj_workspace_capacity_bytes(
-                                        geometry.heads, geometry.hidden, tokens, tokens));
+    for (std::int32_t tokens = 1; tokens <= last; ++tokens) {
+        witness = std::max(witness,
+                           ops::gdn_gating_proj_workspace_capacity_bytes(
+                               geometry.heads, geometry.hidden, tokens, tokens));
     }
     int failures = 0;
     if (interval != witness) {
-        std::cerr << geometry.label << ": GDN control interval missed a route endpoint\n";
+        std::cerr << geometry.label << ": GDN control interval [1, " << last << "] covers "
+                  << interval << "B but point capacity peaks at " << witness << "B\n";
         ++failures;
     }
-    const std::size_t norm_interval =
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 64);
-    const std::size_t norm_witness = std::max(
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 16, 16),
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 64,
-                                                           64));
+
+    const std::size_t norm_interval = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+        geometry.heads, geometry.hidden, 1, 64);
+    std::size_t norm_witness = 0;
+    for (std::int32_t tokens = 1; tokens <= 64; ++tokens) {
+        norm_witness = std::max(
+            norm_witness, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+                              geometry.heads, geometry.hidden, tokens, tokens));
+    }
     if (norm_interval != norm_witness) {
-        std::cerr << geometry.label << ": GDN norm/control interval missed a route endpoint\n";
+        std::cerr << geometry.label << ": GDN norm/control interval [1, 64] covers "
+                  << norm_interval << "B but point capacity peaks at " << norm_witness << "B\n";
         ++failures;
     }
+    return failures;
+}
+
+int verify_device_scheduling() {
+    using S = ninfer::ops::detail::Bf16GdnGatingScheduleId;
+    using N = ninfer::ops::detail::Bf16GdnNormGatingScheduleId;
+    namespace detail = ninfer::ops::detail;
+
+    const ninfer::ops::detail::Bf16GdnGatingProblem p27{48, 5120, 0};
+    const ninfer::ops::detail::Bf16GdnGatingProblem p35{32, 2048, 0};
+
+    auto schedule = [](const ninfer::ops::detail::Bf16GdnGatingProblem& base, std::int32_t cols,
+                       std::int32_t sm) {
+        return detail::bf16_gdn_gating_resolve_plan({base.heads, base.input_rows, cols}, sm)
+            .schedule;
+    };
+
+    struct Case {
+        const char* label;
+        const ninfer::ops::detail::Bf16GdnGatingProblem& base;
+        std::int32_t cols;
+        std::int32_t sm;
+        S expected;
+    };
+
+    // Parity: at the 5090's 170 SMs the tuned route table is unchanged.
+    const Case parity[] = {
+        {"27 T=1", p27, 1, 170, S::GemvPairedRows},
+        {"27 T=8", p27, 8, 170, S::SmallTSplit10},
+        {"27 T=9", p27, 9, 170, S::MmaCooperativeSplit8},
+        {"27 T=1024", p27, 1024, 170, S::MmaCooperativeSplit8},
+        {"27 T=1025", p27, 1025, 170, S::MmaCooperativeSplit4},
+        {"27 T=2048", p27, 2048, 170, S::MmaCooperativeSplit4},
+        {"27 T=2049", p27, 2049, 170, S::MmaCooperativeSplit2},
+        {"27 T=4096", p27, 4096, 170, S::MmaCooperativeSplit2},
+        {"27 T=4097", p27, 4097, 170, S::MmaUnsplit},
+        {"35 T=1", p35, 1, 170, S::MmaCooperativeSplit16},
+        {"35 T=127", p35, 127, 170, S::MmaCooperativeSplit16},
+        {"35 T=128", p35, 128, 170, S::MmaCooperativeSplit8},
+        {"35 T=1024", p35, 1024, 170, S::MmaCooperativeSplit8},
+        {"35 T=1025", p35, 1025, 170, S::MmaCooperativeSplit4},
+        {"35 T=2048", p35, 2048, 170, S::MmaCooperativeSplit4},
+        {"35 T=2049", p35, 2049, 170, S::MmaCooperativeSplit2},
+        {"35 T=4096", p35, 4096, 170, S::MmaCooperativeSplit2},
+        {"35 T=4097", p35, 4097, 170, S::MmaUnsplit},
+    };
+
+    // 70-SM device (RTX PRO 4000 Blackwell): cooperative grids above 140 (27B, 2 CTAs/SM)
+    // or 280 (35B, 4 CTAs/SM) demote to the coarest resident split.
+    const Case small[] = {
+        {"27 T=640", p27, 640, 70, S::MmaCooperativeSplit8},
+        {"27 T=641", p27, 641, 70, S::MmaCooperativeSplit4},
+        {"27 T=1024", p27, 1024, 70, S::MmaCooperativeSplit4},
+        {"27 T=1408", p27, 1408, 70, S::MmaCooperativeSplit4},
+        {"27 T=1409", p27, 1409, 70, S::MmaCooperativeSplit2},
+        {"27 T=2048", p27, 2048, 70, S::MmaCooperativeSplit2},
+        {"27 T=2944", p27, 2944, 70, S::MmaCooperativeSplit2},
+        {"27 T=2945", p27, 2945, 70, S::MmaUnsplit},
+        {"27 T=4096", p27, 4096, 70, S::MmaUnsplit},
+        {"35 T=1024", p35, 1024, 70, S::MmaCooperativeSplit8},
+        {"35 T=4096", p35, 4096, 70, S::MmaCooperativeSplit2},
+    };
+
+    int failures = 0;
+    const auto check = [&](const Case* table, const std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const Case& c2 = table[i];
+            const S actual = schedule(c2.base, c2.cols, c2.sm);
+            if (actual != c2.expected) {
+                std::cerr << c2.label << " sm=" << c2.sm << ": expected "
+                          << detail::bf16_gdn_gating_schedule_name(c2.expected) << ", got "
+                          << detail::bf16_gdn_gating_schedule_name(actual) << "\n";
+                ++failures;
+            }
+        }
+    };
+    check(parity, sizeof(parity) / sizeof(parity[0]));
+    check(small, sizeof(small) / sizeof(small[0]));
+
+    // The fused 35B norm route keeps its cooperative split32 grid on 70 SMs (64 CTAs) but
+    // falls back to the composed route on a device below its residency.
+    auto norm_schedule = [](std::int32_t sm) {
+        return detail::bf16_gdn_norm_gating_resolve_plan({32, 2048, 16}, sm).schedule;
+    };
+    if (norm_schedule(170) != N::MmaCooperativeSplit32) {
+        std::cerr << "35 norm T=16 sm=170: expected fused split32\n";
+        ++failures;
+    }
+    if (norm_schedule(70) != N::MmaCooperativeSplit32) {
+        std::cerr << "35 norm T=16 sm=70: expected fused split32\n";
+        ++failures;
+    }
+    if (norm_schedule(30) != N::Composed) {
+        std::cerr << "35 norm T=16 sm=30: expected composed fallback\n";
+        ++failures;
+    }
+
+    // Interval capacity must cover the mid-band demotion maximum, not just the interval end.
+    const std::size_t cap70 =
+        detail::bf16_gdn_gating_capacity_workspace_bytes(48, 5120, 1, 1024, 70);
+    if (cap70 != static_cast<std::size_t>(8) * 640 * 96 * sizeof(float)) {
+        std::cerr << "27 capacity sm=70 [1,1024]: expected 8*640*96*4, got " << cap70 << "\n";
+        ++failures;
+    }
+    const std::size_t cap170 =
+        detail::bf16_gdn_gating_capacity_workspace_bytes(48, 5120, 1, 1024, 170);
+    if (cap170 != static_cast<std::size_t>(8) * 1024 * 96 * sizeof(float)) {
+        std::cerr << "27 capacity sm=170 [1,1024]: expected 8*1024*96*4, got " << cap170 << "\n";
+        ++failures;
+    }
+
     return failures;
 }
 
@@ -436,8 +555,9 @@ int main() {
     }
 
     int failures = 0;
-    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
-    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
+    failures += verify_device_scheduling();
+    failures += verify_workspace_capacity_contract(kQwen27, 4097);
+    failures += verify_workspace_capacity_contract(kQwen35, 4097);
 
     // Every registered 27B projection route, including predicated and full token tiles.
     for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {

@@ -29,9 +29,11 @@ struct RouteSpec {
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
-    // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
-    // of making T a launch limit. Once the unsplit grid has enough independent work, it also
-    // removes the cooperative-residency constraint.
+    // As token tiles double, halve SplitK. This keeps the cooperative grid near half of the
+    // 5090's tuned residency instead of making T a launch limit. On devices with fewer SMs the
+    // resolver demotes a route whose tuned grid no longer fits to the next coarser resident
+    // split. Once the unsplit grid has enough independent work, it also removes the
+    // cooperative-residency constraint.
     {{9, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
     {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
@@ -39,7 +41,8 @@ constexpr std::array<RouteSpec, 6> k27Routes{{
 }};
 
 constexpr std::array<RouteSpec, 5> k35Routes{{
-    // The same progression keeps the long-range cooperative routes near 256 CTAs.
+    // The same progression keeps the long-range cooperative routes near the 5090's tuned
+    // residency; smaller devices demote through the same chain.
     {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
     {{128, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
     {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
@@ -123,25 +126,47 @@ bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t
     return grid_ctas <= resident_ctas;
 }
 
-bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
+bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols,
+                                     std::int32_t sm_count) noexcept {
     // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
     // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
-    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
+    // 2 * sm_count resident CTAs device-wide (340 on the 170-SM RTX 5090). There are three
+    // 16-row tiles per token tile.
+    return cooperative_grid_is_resident(schedule, cols, 128, 3, 2 * sm_count);
 }
 
-bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
+bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols,
+                                     std::int32_t sm_count) noexcept {
     // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
     // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
-    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
+    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. On the 170-SM RTX 5090 the
     // device-wide limits are 340 and 680 CTAs respectively.
-    const std::int32_t resident_ctas =
-        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
-    return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
+    const std::int32_t ctas_per_sm =
+        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 2 : 4;
+    return cooperative_grid_is_resident(schedule, cols, 64, 2, ctas_per_sm * sm_count);
 }
 
-bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
-                        const Bf16GdnGatingProblem& problem) noexcept {
+// When the tuned cooperative schedule no longer fits a smaller device, demote to the next
+// coarser cooperative split; the unsplit grid is a plain (non-cooperative) launch and always
+// fits. At 170 SMs the tuned schedule is always resident, so no demotion ever fires there.
+Bf16GdnGatingScheduleId next_demotion(Bf16GdnGatingScheduleId schedule) noexcept {
+    switch (schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+        return Bf16GdnGatingScheduleId::MmaCooperativeSplit8;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
+        return Bf16GdnGatingScheduleId::MmaCooperativeSplit4;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
+        return Bf16GdnGatingScheduleId::MmaCooperativeSplit2;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+        return Bf16GdnGatingScheduleId::MmaUnsplit;
+    default:
+        return schedule; // MmaUnsplit terminates the chain.
+    }
+}
+
+bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingProblem& problem,
+                        std::int32_t sm_count) noexcept {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
     if (is_27(problem)) {
         switch (schedule) {
@@ -152,7 +177,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-            return cooperative_27_grid_is_resident(schedule, problem.cols);
+            return cooperative_27_grid_is_resident(schedule, problem.cols, sm_count);
         case Bf16GdnGatingScheduleId::MmaUnsplit:
             return true;
         case Bf16GdnGatingScheduleId::SimtWarpRowC4:
@@ -175,7 +200,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-        return cooperative_35_grid_is_resident(schedule, problem.cols);
+        return cooperative_35_grid_is_resident(schedule, problem.cols, sm_count);
     case Bf16GdnGatingScheduleId::GemvPairedRows:
     case Bf16GdnGatingScheduleId::SmallTSplit10:
         return false;
@@ -273,20 +298,6 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
-template <std::size_t N>
-std::size_t route_capacity(const std::array<RouteSpec, N>& routes, const Bf16GdnGatingProblem& base,
-                           std::int32_t min_cols, std::int32_t max_cols) {
-    std::size_t maximum = 0;
-    for (const RouteSpec& route : routes) {
-        if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
-        const std::int32_t endpoint = std::min(route.cols.last, max_cols);
-        maximum                     = std::max(
-            maximum,
-            bf16_gdn_gating_resolve_plan({base.heads, base.input_rows, endpoint}).workspace_bytes);
-    }
-    return maximum;
-}
-
 } // namespace
 
 const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noexcept {
@@ -331,8 +342,12 @@ bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
-                                                    const Bf16GdnGatingProblem& problem) {
-    if (!candidate_is_legal(schedule, problem)) {
+                                                    const Bf16GdnGatingProblem& problem,
+                                                    std::int32_t sm_count) {
+    if (sm_count < 1) {
+        throw std::invalid_argument("BF16 GDN gating: sm_count must be positive");
+    }
+    if (!candidate_is_legal(schedule, problem, sm_count)) {
         throw std::invalid_argument("BF16 GDN gating: candidate is not legal for exact problem");
     }
     const bool mma                          = schedule_uses_mma(schedule);
@@ -346,47 +361,117 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
     return {schedule, variant, workspace};
 }
 
-Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                               std::int32_t sm_count) {
     if (!bf16_gdn_gating_admits(problem)) {
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
+    if (sm_count < 1) {
+        throw std::invalid_argument("BF16 GDN gating: sm_count must be positive");
+    }
+    Bf16GdnGatingScheduleId schedule = Bf16GdnGatingScheduleId::MmaUnsplit;
+    bool found                       = false;
     if (is_27(problem)) {
         for (const RouteSpec& route : k27Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                schedule = route.schedule;
+                found    = true;
+                break;
             }
         }
     } else {
         for (const RouteSpec& route : k35Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                schedule = route.schedule;
+                found    = true;
+                break;
             }
         }
     }
-    throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
+    if (!found) {
+        throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
+    }
+    while (!candidate_is_legal(schedule, problem, sm_count)) {
+        schedule = next_demotion(schedule);
+    }
+    return bf16_gdn_gating_resolve_candidate(schedule, problem, sm_count);
+}
+
+template <bool kIs35>
+std::size_t cooperative_band_capacity(std::int32_t heads, std::int32_t lo, std::int32_t hi,
+                                      Bf16GdnGatingScheduleId schedule, std::int32_t sm_count) {
+    // The demoted schedule's partial area is split * T, piecewise linear in T with a drop at
+    // each residency boundary, so the interval maximum sits at a demotion boundary or at hi.
+    constexpr std::int32_t kTileCols = kIs35 ? 64 : 128;
+    constexpr std::int32_t kRowTiles = kIs35 ? 2 : 3;
+    std::int64_t best_tokens = 0;
+    std::int32_t split       = schedule_split_k(schedule);
+    while (true) {
+        const std::int32_t ctas_per_sm = (kIs35 && split != 32) ? 4 : 2;
+        const std::int64_t upper = split == 1
+                                       ? static_cast<std::int64_t>(hi)
+                                       : static_cast<std::int64_t>(kTileCols) *
+                                             (static_cast<std::int64_t>(ctas_per_sm) * sm_count /
+                                              (kRowTiles * split));
+        if (upper >= lo) {
+            const std::int64_t tokens = std::min<std::int64_t>(hi, upper);
+            if (tokens * split > best_tokens) { best_tokens = tokens * split; }
+        }
+        if (split == 1) { break; }
+        split /= 2;
+    }
+    return static_cast<std::size_t>(best_tokens) * static_cast<std::size_t>(2 * heads) *
+           sizeof(float);
+}
+
+template <typename Routes>
+std::size_t routes_capacity(const Routes& routes, const bool is35, std::int32_t heads,
+                            std::int32_t input_rows, std::int32_t min_cols, std::int32_t max_cols,
+                            std::int32_t sm_count) {
+    std::size_t maximum = 0;
+    for (const RouteSpec& route : routes) {
+        const std::int32_t lo = std::max(route.cols.first, min_cols);
+        const std::int32_t hi = std::min(route.cols.last, max_cols);
+        if (lo > hi) { continue; }
+        const bool mma_band = schedule_uses_mma(route.schedule) &&
+                              route.schedule != Bf16GdnGatingScheduleId::MmaUnsplit;
+        const std::size_t bytes = mma_band
+            ? (is35 ? cooperative_band_capacity<true>(heads, lo, hi, route.schedule, sm_count)
+                    : cooperative_band_capacity<false>(heads, lo, hi, route.schedule, sm_count))
+            : bf16_gdn_gating_resolve_plan({heads, input_rows, hi}, sm_count).workspace_bytes;
+        maximum = std::max(maximum, bytes);
+    }
+    return maximum;
 }
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
-                                                     std::int32_t min_cols, std::int32_t max_cols) {
+                                                     std::int32_t min_cols, std::int32_t max_cols,
+                                                     std::int32_t sm_count) {
     if (min_cols <= 0 || max_cols < min_cols) {
         throw std::invalid_argument("BF16 GDN gating: invalid column interval");
     }
+    if (sm_count < 1) {
+        throw std::invalid_argument("BF16 GDN gating: sm_count must be positive");
+    }
     const Bf16GdnGatingProblem base{heads, input_rows, 1};
-    (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols});
-    (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols});
-    return is_27(base) ? route_capacity(k27Routes, base, min_cols, max_cols)
-                       : route_capacity(k35Routes, base, min_cols, max_cols);
+    (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols}, sm_count);
+    (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols}, sm_count);
+    return is_27(base)
+               ? routes_capacity(k27Routes, false, heads, input_rows, min_cols, max_cols, sm_count)
+               : routes_capacity(k35Routes, true, heads, input_rows, min_cols, max_cols, sm_count);
 }
 
-Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
-    Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
+Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                                        std::int32_t sm_count) {
+    Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem, sm_count);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
-    if (is_35(problem) && problem.cols <= 16) {
+    if (is_35(problem) && problem.cols <= 16 &&
+        candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit32, problem, sm_count)) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
-                                                     problem);
-        schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
+                                                     problem, sm_count);
+        schedule    = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
     }
     const std::size_t norm_partial_bytes =
@@ -397,14 +482,16 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
 std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_cols,
-                                                          std::int32_t max_cols) {
+                                                          std::int32_t max_cols,
+                                                          std::int32_t sm_count) {
     std::size_t maximum =
-        bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
+        bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols, sm_count);
     if (heads == 32 && input_rows == 2048 && min_cols <= 16) {
         const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
         maximum                       = std::max(
             maximum,
-            bf16_gdn_norm_gating_resolve_plan({heads, input_rows, fused_cols}).workspace_bytes);
+            bf16_gdn_norm_gating_resolve_plan({heads, input_rows, fused_cols}, sm_count)
+                .workspace_bytes);
     }
     return maximum;
 }
@@ -412,9 +499,10 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
 void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x,
                                   const Weight& a_weight, const Weight& b_weight,
                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                  Tensor& g, Tensor& beta, cudaStream_t stream) {
+                                  Tensor& g, Tensor& beta, cudaStream_t stream,
+                                  std::int32_t sm_count) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
-    const Bf16GdnGatingPlan resolved = bf16_gdn_gating_resolve_plan(problem);
+    const Bf16GdnGatingPlan resolved = bf16_gdn_gating_resolve_plan(problem, sm_count);
     if (resolved.schedule != plan.schedule || resolved.token_variant != plan.token_variant ||
         resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("BF16 GDN gating: plan does not match the exact problem");
@@ -426,25 +514,30 @@ void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const T
                                        const Weight& a_weight, const Weight& b_weight,
                                        const Tensor& A_log, const Tensor& dt_bias,
                                        WorkspaceArena& ws, Tensor& g, Tensor& beta,
-                                       cudaStream_t stream) {
+                                       cudaStream_t stream, std::int32_t sm_count) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
-    const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_candidate(schedule, problem);
+    const Bf16GdnGatingPlan plan =
+        bf16_gdn_gating_resolve_candidate(schedule, problem, sm_count);
     execute_resolved(plan, problem, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                               const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                              Tensor& g, Tensor& beta, cudaStream_t stream) {
-    const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_plan({g.ne[0], x.ne[0], x.ne[1]});
-    bf16_gdn_gating_execute_plan(plan, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+                              Tensor& g, Tensor& beta, cudaStream_t stream,
+                              std::int32_t sm_count) {
+    const Bf16GdnGatingPlan plan =
+        bf16_gdn_gating_resolve_plan({g.ne[0], x.ne[0], x.ne[1]}, sm_count);
+    bf16_gdn_gating_execute_plan(plan, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream,
+                                 sm_count);
 }
 
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
                                    const Weight& a_weight, const Weight& b_weight,
                                    const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                   Tensor& g, Tensor& beta, cudaStream_t stream) {
+                                   Tensor& g, Tensor& beta, cudaStream_t stream,
+                                   std::int32_t sm_count) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
-    const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
+    const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem, sm_count);
     if (plan.schedule == Bf16GdnNormGatingScheduleId::Composed) {
         rmsnorm(x, norm_weight, eps, true, h, stream);
         execute_resolved(plan.control, problem, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta,

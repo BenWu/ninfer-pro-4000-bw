@@ -2,6 +2,7 @@
 // preparation, including their paired fixed rotation, remains private to the included kernel.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
+#include "ops/common/device_geometry.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
@@ -59,11 +60,12 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         return div_up(window, kKeysPerSplit);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
-    // one 170-SM wave after accounting for the geometry's KV-head count.
+    // one wave of the current device's SMs after accounting for the geometry's KV-head count.
     if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
-        const std::int32_t splits   = div_up(window, 192 / Geometry::SmallTSplitScale);
+        const std::int32_t splits = div_up(window, 192 / Geometry::SmallTSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;
-        constexpr std::int32_t kMax = 42 * Geometry::SmallTSplitScale;
+        const std::int32_t kMax =
+            (current_device_sm_count() / Geometry::KVHeads) * Geometry::SmallTSplitScale;
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
         return (clamped < kMax) ? clamped : kMax;
     }

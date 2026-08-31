@@ -1,5 +1,6 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 
+#include "ops/common/device_geometry.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include <cmath>
@@ -81,7 +82,8 @@ std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::in
                                                      std::int32_t min_tokens,
                                                      std::int32_t max_tokens) {
     return detail::bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
-                                                            max_tokens);
+                                                            max_tokens,
+                                                            detail::current_device_sm_count());
 }
 
 std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
@@ -89,7 +91,8 @@ std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens) {
     return detail::bf16_gdn_norm_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
-                                                                 max_tokens);
+                                                                 max_tokens,
+                                                                 detail::current_device_sm_count());
 }
 
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
@@ -105,7 +108,8 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     require_bf16_weight(a_weight, 48, 5120, "a_weight");
     require_bf16_weight(b_weight, 48, 5120, "b_weight");
 
-    detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream,
+    detail::current_device_sm_count());
 }
 
 void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_log,
@@ -122,7 +126,8 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
-    detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream,
+    detail::current_device_sm_count());
 }
 
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
@@ -145,7 +150,8 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_bf16_weight(b_weight, 48, 5120, "b_weight");
 
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, stream);
+                                          dt_bias, ws, g, beta, stream,
+                                          detail::current_device_sm_count());
 }
 
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
@@ -169,7 +175,8 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, stream);
+                                          dt_bias, ws, g, beta, stream,
+                                          detail::current_device_sm_count());
 }
 
 } // namespace ninfer::ops

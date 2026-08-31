@@ -10,8 +10,9 @@
 
 namespace ninfer::ops {
 
-// The geometry is the fixed implementation profile. Each query covers every T in the inclusive
-// interval; invalid profiles or intervals throw.
+// The geometry is the fixed implementation profile. Schedules are selected against the current
+// device's cooperative-launch residency, so workspace capacity is device-dependent. Each query
+// covers every T in the inclusive interval; invalid profiles or intervals throw.
 [[nodiscard]] std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                                    std::int32_t input_rows,
                                                                    std::int32_t min_tokens,

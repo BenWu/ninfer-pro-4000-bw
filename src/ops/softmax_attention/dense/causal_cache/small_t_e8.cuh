@@ -40,9 +40,9 @@ __device__ __forceinline__ void causal_small_t_e8_decode_packed_k16(const std::u
     const auto* codes       = reinterpret_cast<const std::uint8_t*>(&raw);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        causal_small_t_i8_store_swz(k_tile, row, d + 2 * i, d_b16_stride,
+        causal_small_t_store_byte_swizzled(k_tile, row, d + 2 * i, d_b16_stride,
                                     kv_cache_unpack_i4(codes[i], 0));
-        causal_small_t_i8_store_swz(k_tile, row, d + 2 * i + 1, d_b16_stride,
+        causal_small_t_store_byte_swizzled(k_tile, row, d + 2 * i + 1, d_b16_stride,
                                     kv_cache_unpack_i4(codes[i], 1));
     }
 }
@@ -61,7 +61,7 @@ __device__ __forceinline__ void causal_small_t_e8_decode_key_group(const std::ui
             e8_root_decode_8d_fast(raw16[2 * b], raw16[2 * b + 1], dec);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                causal_small_t_i8_store_swz(k_tile, row, d + 8 * b + i, d_b16_stride, dec[i]);
+                causal_small_t_store_byte_swizzled(k_tile, row, d + 8 * b + i, d_b16_stride, dec[i]);
             }
         }
     }
@@ -305,8 +305,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             amax            = warp_max(amax, FullMask);
             const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
             const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-            causal_small_t_i8_store_swz(q_i8, row, d0, DB16, kv_cache_int8_quant_code(x0, inv));
-            causal_small_t_i8_store_swz(q_i8, row, d1, DB16, kv_cache_int8_quant_code(x1, inv));
+            causal_small_t_store_byte_swizzled(q_i8, row, d0, DB16, kv_cache_int8_quant_code(x0, inv));
+            causal_small_t_store_byte_swizzled(q_i8, row, d1, DB16, kv_cache_int8_quant_code(x1, inv));
             if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
         }
     }

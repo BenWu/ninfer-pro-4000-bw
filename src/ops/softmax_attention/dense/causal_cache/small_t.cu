@@ -44,6 +44,14 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
     return (splits < Geometry::SmallTMaximumSplits) ? splits : Geometry::SmallTMaximumSplits;
 }
 
+// The E8 modes decode into the INT8 QK arena and share its partial-accumulator and split
+// geometry, so every INT8 launch decision below applies to them as well. They used to match
+// implicitly by being DType::I8; the storage enum makes the relationship explicit.
+constexpr bool causal_small_t_uses_int8_qk(KvCacheStorage storage) {
+    return storage == KvCacheStorage::Int8Group64 || storage == KvCacheStorage::RK4V4E8 ||
+           storage == KvCacheStorage::RK2V4E8;
+}
+
 template <typename Geometry>
 std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens,
                                         KvCacheStorage storage) {
@@ -55,16 +63,16 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
     // A 64-key default split just above a 32-key boundary makes the partial kernel execute a
     // nearly empty second tile. T=5 uses one 32-key tile per split; the short T=6 profile keeps
     // all newly appended rows in one tail split while retaining a useful B=8 grid.
-    if (storage == KvCacheStorage::Int8Group64 && tokens == 5 && window > 128 && window <= 512) {
+    if (causal_small_t_uses_int8_qk(storage) && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::SmallTSplitScale);
     }
-    if (storage == KvCacheStorage::Int8Group64 && tokens == 6 && window > 128 && window <= 160) {
+    if (causal_small_t_uses_int8_qk(storage) && tokens == 6 && window > 128 && window <= 160) {
         constexpr std::int32_t kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
         return div_up(window, kKeysPerSplit);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one wave of the current device's SMs after accounting for the geometry's KV-head count.
-    if (storage == KvCacheStorage::Int8Group64 && tokens == 6 && window > 5000 && window <= 8198) {
+    if (causal_small_t_uses_int8_qk(storage) && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::SmallTSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;
         const std::int32_t kMax =
@@ -446,7 +454,7 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
             launch_profile.template operator()<PartialAcc, Int8, true, false>();
         }
     };
-    if (cache.storage == KvCacheStorage::Int8Group64) {
+    if (causal_small_t_uses_int8_qk(cache.storage)) {
         launch_for_dtype.template operator()<__nv_bfloat16, true>();
     } else {
         launch_for_dtype.template operator()<float, false>();

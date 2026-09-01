@@ -39,6 +39,33 @@ Also on this branch: per-plane leading extents in `d256_profile.h`, new op tests
 generator (`tools/gen_niah_fixtures.py`), four new long-context fixtures, and the measurement
 write-ups in `docs/plans/`.
 
+### Serving on this card
+
+`./serve.sh` starts `ninfer-serve` with the NVFP4 artifact, NVFP4 KV, vision and MTP3, using the
+context measured below. Everything is env-overridable (`CTX`, `PORT`, `DEVICE`, `KV_DTYPE`,
+`MAX_CONCURRENCY`, `VISION=0`, `MTP=0`) and extra flags pass through to the server.
+
+Largest `--max-context` that starts, NVFP4 weights with NVFP4 KV at `--max-concurrency 1`:
+
+| config | max context | slack at that context |
+|---|---|---|
+| plain | 196608 | 109 MiB |
+| `--vision` | 131072 | 307 MiB |
+| MTP3 | 131072 | 266 MiB |
+| `--vision` + MTP3 | **90112** | 75 MiB |
+
+Cost of each feature before KV is allocated: vision 282 MiB, MTP3 771 MiB. MTP3 is the expensive
+one, at nearly three times vision, because of its recurrent draft state.
+
+`serve.sh` defaults to 81920 rather than the 90112 ceiling. Starting with 75 MiB to spare works but
+leaves nothing for a raised `--max-concurrency`, a larger media payload, or a different driver
+state, and 81920 keeps 228 MiB. Note that `--max-concurrency` lowers every number in this table:
+the context-cache defaults scale off it, with device-state slots equal to concurrency, private
+continuations at twice that, and shared prefixes at one times.
+
+A ladder that steps by 32768 reports 65536 for the vision plus MTP3 row, because 98304 misses by
+only 82 MB. The real ceiling is 38% higher, so probe the gap rather than trusting a coarse sweep.
+
 ### Running the tests
 
 ```bash
@@ -72,6 +99,11 @@ resident). None of the other supported checkpoints were measured on this card, s
 these numbers to Qwen3.6-27B or Qwen3.6-35B-A3B.
 
 Baseline for comparison: int8 KV, 31.00 tok/s decode, 196608 max starting context.
+
+These tables were taken before the rebase onto upstream's nvfp4/k8v4 work. They remain valid for
+what they measured, but do not compare them across that boundary: int8 decode moved from 31.00 to
+31.69 tok/s over the rebase, most likely from upstream's `fp16 V storage and PV compute` change.
+The comparison section below is a single post-rebase session and is internally consistent.
 
 **Capacity.** E8 buys context that int8 cannot reach.
 
@@ -166,6 +198,103 @@ the tool's own limit (0.35 against a 0.365 p95) and is not sampling noise: 5x th
 to 0.349 with the same ordering failure. Serving falls back to generic transfer costs. Building
 the calibrator needs `-DNINFER_BUILD_BENCHMARKS=ON`.
 
+### Comparison against upstream nvfp4 and k8v4
+
+Upstream added two low-bit KV modes of its own, `nvfp4` (group-16 scales on both planes) and
+`k8v4` (FP8 key plus NVFP4 value). This branch is rebased onto them, so all five modes were
+measured on the same card in the same session against the same fixtures. Groupwise-int weights,
+Qwen3.8-27B, device 1, ECC on.
+
+**Storage.** Measured KV payload at 32768 capacity, which matches the per-token arithmetic from
+the layout tables to within 0.001 in every case.
+
+| mode | payload @32768 | vs int8 | K + V bytes per token per head | max context |
+|---|---|---|---|---|
+| int8 g64 | 1.03 GiB | 1.000 | 528 | 196608 |
+| k8v4 | 804 MiB | 0.762 | 402 | 262144 |
+| nvfp4 g16 | 576 MiB | 0.546 | 288 | 262144 |
+| rk4v4-e8 | 544 MiB | 0.516 | 272 | 262144 |
+| rk2v4-e8 | 416 MiB | 0.394 | 208 | 262144 |
+
+`rk4v4-e8` is only 5.6% smaller than `nvfp4`. Only `rk2v4-e8` is meaningfully more compact, at 28%
+below it.
+
+**Decode, tok/s at 32K, median of three.** This shape cannot separate the modes: decode is
+dominated by streaming 15.92 GiB of weights and everything lands within 2%. The ordering still
+tracks decode cost per key.
+
+| mode | median | vs int8 |
+|---|---|---|
+| nvfp4 | 31.70 | 0.0% |
+| int8 | 31.69 | n/a |
+| k8v4 | 31.47 | 0.7% |
+| rk4v4-e8 | 31.26 | 1.4% |
+| rk2v4-e8 | 31.07 | 2.0% |
+
+**Prefill, tok/s. This is the decisive measurement.**
+
+| mode | 32K | 64K | 128K | vs int8 @128K |
+|---|---|---|---|---|
+| k8v4 | 1063.24 | 979.70 | 858.31 | +5.1% |
+| nvfp4 | 1058.34 | 974.30 | 847.46 | +3.8% |
+| int8 | 1045.04 | 954.14 | 816.45 | n/a |
+| rk4v4-e8 | 1004.04 | 887.18 | 727.85 | -10.9% |
+| rk2v4-e8 | 969.02 | 832.61 | 658.38 | -19.4% |
+
+Both upstream modes are faster than int8 at every length and pull further ahead as context grows.
+Both E8 modes are slower and fall further behind. One mechanism explains both directions. Every
+mode except int8 pays a decode per key tile per query block, and int8 pays none but reads 528 bytes
+per token per head. The question is only whether that decode costs less than the bandwidth it
+saves. For NVFP4's multiply by a group-16 scale it does, so the advantage grows as KV traffic
+becomes a larger share of prefill. For the E8 lattice decode it does not, so the same rising share
+turns into a widening penalty.
+
+Against `nvfp4` specifically, `rk4v4-e8` trails by 5.1%, 8.9% and 14.1% at 32K, 64K and 128K. The
+storage advantage that buys is a fixed 5.6%, so the trade is underwater from roughly 64K onward.
+
+**Retrieval.** All ten runs exact, on both withheld-answer fixtures, for every mode. Accuracy does
+not separate these codecs at this scale, so the decision rests on the prefill table above.
+
+Decode at long context does separate them, unlike the 32K shape, because KV traffic is now a real
+share of the work. The ordering matches prefill exactly.
+
+| mode | 111K single needle | 118K five needles | answers |
+|---|---|---|---|
+| k8v4 | 26.85 | 26.37 | all exact |
+| nvfp4 | 26.78 | 26.31 | all exact |
+| int8 | 25.61 | 25.36 | all exact |
+| rk4v4-e8 | 25.36 | 25.18 | all exact |
+| rk2v4-e8 | 23.70 | 23.39 | all exact |
+
+Both upstream modes decode faster than int8 at this context; both E8 modes decode slower.
+
+**Same comparison on NVFP4 weights.** `nvfp4` KV against `rk4v4-e8` KV, artifact
+`models/qwen3_8_27b_nvfp4.ninfer`. NVFP4 weights make prefill roughly 2 to 3x faster, and that
+makes the E8 penalty worse, not better.
+
+| context | nvfp4 KV | rk4v4-e8 | gap | gap on groupwise weights |
+|---|---|---|---|---|
+| 32K | 3005.48 | 2606.43 | 13.3% | 5.1% |
+| 64K | 2451.70 | 1936.86 | 21.0% | 8.9% |
+| 128K | 1763.00 | 1299.68 | 26.3% | 14.1% |
+
+Two axes amplify the same fixed cost independently. Longer context raises KV's share of prefill,
+and faster weights raise the codec's share of what is left, so the penalty roughly doubles at every
+length. The E8 decode is per key tile per query block and does not shrink when anything else gets
+faster.
+
+Both modes cap at 196608 on these weights, so E8 buys no extra context here, though it does leave
+about twice the slack at that ceiling (447.94 MiB against 256.00 MiB). Retrieval is again exact for
+both on both fixtures, with decode 24.58 against 25.84 tok/s at 111K and 24.31 against 25.57 at
+118K.
+
+**Why E8 is still here.** On these numbers `nvfp4` dominates `rk4v4-e8`: 5.6% more memory for
+strictly better prefill at every length, and it is upstream code that will keep getting attention.
+`rk2v4-e8` keeps a real 28% storage edge over `nvfp4` but pays about 22% of prefill for it. This is
+a personal fork and the E8 modes are kept deliberately for their pedagogical value: the port is a
+worked example of E8 lattice quantization, warp-cooperative encoding, and the debugging that came
+with it. They are not the modes to reach for on throughput.
+
 ### Known limits
 
 - `rk2v4-e8` ships with a disclaimer. It is correct everywhere tested, and with NVFP4 weights it
@@ -173,7 +302,9 @@ the calibrator needs `-DNINFER_BUILD_BENCHMARKS=ON`.
   about twice rk4v4-e8's prefill. It is not being optimized. The likely costs are a divergent
   gather over a 2 KB `__device__ const` table and 256 FP32 convert/round operations per key row,
   neither of which rk4v4-e8 pays.
-- The prefill gate fails for both modes and is structural, not a bug.
+- The prefill gate fails for both E8 modes and is structural, not a bug. Read it alongside the
+  upstream comparison below: `nvfp4` and `k8v4` are *faster* than int8 on the same measurement, so
+  the E8 prefill cost is not the price of low-bit KV in general, only of this codec.
 - The `examples/cli/messages/long_niah_*.json` fixtures state their answers in the question.
 - MTP and dflash CUDA Graph profile families are unqualified for E8.
 - Unexplained and unpursued: NVFP4 decode is flat despite 19% more weight bytes to stream, and the

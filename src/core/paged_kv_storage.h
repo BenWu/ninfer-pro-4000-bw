@@ -87,6 +87,26 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::U8, 16}};
         }
         break;
+    // E8 lattice modes. K and V are H64-rotated per 64-dimension group before quantization and
+    // share one FP16 scale per group, so both planes carry a 4-entry scale extent. V is packed
+    // 4-bit in both. K is packed 4-bit lattice codes (RK4V4E8) or a 2-byte root-cylinder code per
+    // 8 rotated dimensions (RK2V4E8), which is why the key extent differs between them.
+    case KvCacheStorage::RK4V4E8:
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 128, DType::FP16, 4},
+                    {DType::U8, 128, DType::FP16, 4}};
+        }
+        break;
+    case KvCacheStorage::RK2V4E8:
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 64, DType::FP16, 4},
+                    {DType::U8, 128, DType::FP16, 4}};
+        }
+        break;
     }
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }

@@ -342,11 +342,7 @@ int e8_append_case(int kv_heads, bool root_mode, int tokens = 3) {
         .block_table  = Tensor(d_mapping.p, DType::I32, {logical_pages}),
         .head_dim     = kHeadDim,
         .num_kv_heads = kv_heads,
-        .dtype        = DType::I8,
-        .quant_group  = kGroup,
-        .v_packed_i4  = true,
-        .k_packed_i4  = !root_mode,
-        .k_e8_root    = root_mode,
+        .storage      = root_mode ? KvCacheStorage::RK2V4E8 : KvCacheStorage::RK4V4E8,
     };
 
     // RK2V4E8 bookkeeping: the rotated key of every 8-dimension block, the group scale that goes

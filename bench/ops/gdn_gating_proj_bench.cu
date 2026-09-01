@@ -7,6 +7,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer_bench_common.h"
+#include "ops/common/device_geometry.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include <cuda_runtime.h>
@@ -197,10 +198,12 @@ void run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const Weight wb     = bf16_row_view(parent, heads, heads);
 
     const ops::detail::Bf16GdnGatingProblem problem{heads, hidden, tokens};
+    const std::int32_t sm_count       = ops::detail::current_device_sm_count();
     const auto plan                   = opt.auto_route || opt.composed_norm_control
-                                            ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
-                                            : ops::detail::bf16_gdn_gating_resolve_candidate(opt.candidate, problem);
-    const auto norm_plan              = ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
+                                            ? ops::detail::bf16_gdn_gating_resolve_plan(problem, sm_count)
+                                            : ops::detail::bf16_gdn_gating_resolve_candidate(
+                                                  opt.candidate, problem, sm_count);
+    const auto norm_plan = ops::detail::bf16_gdn_norm_gating_resolve_plan(problem, sm_count);
     const std::size_t workspace_bytes = std::max(interval_capacity, plan.workspace_bytes);
     WorkspaceArena ws(std::max<std::size_t>(1, workspace_bytes));
     const auto launch = [&](cudaStream_t stream) {
@@ -227,7 +230,8 @@ void run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
             }
         } else {
             ops::detail::bf16_gdn_gating_execute_candidate(opt.candidate, tx, wa, wb, tA_log,
-                                                           tdt_bias, ws, tg, tbeta, stream);
+                                                           tdt_bias, ws, tg, tbeta, stream,
+                                                           sm_count);
         }
     };
     const bench::ColdTiming timing =

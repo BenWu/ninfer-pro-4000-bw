@@ -110,8 +110,13 @@ Options parse_options(int argc, char** argv) {
                 out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
             } else if (dtype == "k8v4") {
                 out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+            } else if (dtype == "rk4v4-e8") {
+                out.kv = ninfer::KvCacheStorage::RK4V4E8;
+            } else if (dtype == "rk2v4-e8") {
+                out.kv = ninfer::KvCacheStorage::RK2V4E8;
             } else {
-                usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
+                usage_error(
+                    "--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, rk4v4-e8, or rk2v4-e8");
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
@@ -141,6 +146,10 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case ninfer::KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
     }
     throw std::logic_error("unknown KV dtype");
 }

@@ -53,8 +53,8 @@ __device__ __forceinline__ void causal_prompt_e8_decode_packed_k16(const std::ui
     const auto* codes = reinterpret_cast<const std::uint8_t*>(&raw);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        causal_prompt_i8_store_swz(k_tile, row, d + 2 * i, kv_cache_unpack_i4(codes[i], 0));
-        causal_prompt_i8_store_swz(k_tile, row, d + 2 * i + 1, kv_cache_unpack_i4(codes[i], 1));
+        causal_prompt_store_byte_swizzled<std::int8_t>(k_tile, row, d + 2 * i, kv_cache_unpack_i4(codes[i], 0));
+        causal_prompt_store_byte_swizzled<std::int8_t>(k_tile, row, d + 2 * i + 1, kv_cache_unpack_i4(codes[i], 1));
     }
 }
 
@@ -73,7 +73,7 @@ __device__ __forceinline__ void causal_prompt_e8_decode_key_group(const std::uin
             e8_root_decode_8d_fast(raw16[2 * b], raw16[2 * b + 1], dec);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                causal_prompt_i8_store_swz(k_tile, row, d + 8 * b + i, dec[i]);
+                causal_prompt_store_byte_swizzled<std::int8_t>(k_tile, row, d + 8 * b + i, dec[i]);
             }
         }
     }
@@ -174,8 +174,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_e8_kernel(
             absmax          = warp_max(absmax, FullMask);
             const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
             const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-            causal_prompt_i8_store_swz(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
-            causal_prompt_i8_store_swz(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
+            causal_prompt_store_byte_swizzled<std::int8_t>(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
+            causal_prompt_store_byte_swizzled<std::int8_t>(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
             if (lane == 0) { q_scale[row * Groups + grp] = qs; }
         }
     }
@@ -310,7 +310,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_e8_kernel(
                 } else {
 #pragma unroll
                     for (int d = grp * (D / Groups); d < grp * (D / Groups) + D / Groups; ++d) {
-                        causal_prompt_i8_store_swz(k_i8, key_l, d, 0);
+                        causal_prompt_store_byte_swizzled<std::int8_t>(k_i8, key_l, d, 0);
                     }
                 }
             }
@@ -328,7 +328,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_e8_kernel(
                 } else {
 #pragma unroll
                     for (int i = 0; i < 16; ++i) {
-                        causal_prompt_i8_store_swz(k_i8, key_l, d + i, 0);
+                        causal_prompt_store_byte_swizzled<std::int8_t>(k_i8, key_l, d + i, 0);
                     }
                 }
             }
@@ -453,10 +453,10 @@ __global__ __maxnreg__(120) void causal_attention_prompt_e8_kernel(
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                p_s[row0 * Bc + causal_prompt_i8_p_swz(row0, col0)] = __float2half_rn(p00);
-                p_s[row0 * Bc + causal_prompt_i8_p_swz(row0, col1)] = __float2half_rn(p01);
-                p_s[row1 * Bc + causal_prompt_i8_p_swz(row1, col0)] = __float2half_rn(p10);
-                p_s[row1 * Bc + causal_prompt_i8_p_swz(row1, col1)] = __float2half_rn(p11);
+                p_s[row0 * Bc + causal_prompt_p_swz<kCausalPromptI8Bc>(row0, col0)] = __float2half_rn(p00);
+                p_s[row0 * Bc + causal_prompt_p_swz<kCausalPromptI8Bc>(row0, col1)] = __float2half_rn(p01);
+                p_s[row1 * Bc + causal_prompt_p_swz<kCausalPromptI8Bc>(row1, col0)] = __float2half_rn(p10);
+                p_s[row1 * Bc + causal_prompt_p_swz<kCausalPromptI8Bc>(row1, col1)] = __float2half_rn(p11);
             }
             bl0        = warp_sum<4>(bl0, FullMask);
             bl1        = warp_sum<4>(bl1, FullMask);
@@ -547,7 +547,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_e8_kernel(
             const int pcol = k * 16 + a_coloff;
             ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
                         smem_addr(&p_s[(row_base + a_rowoff) * Bc +
-                                       causal_prompt_i8_p_swz(row_base + a_rowoff, pcol)]));
+                                       causal_prompt_p_swz<kCausalPromptI8Bc>(row_base + a_rowoff, pcol)]));
 #pragma unroll
             for (int n = 0; n < PVNtPerWarp; ++n) {
                 const int global_n = d_slice * PVNtPerWarp + n;

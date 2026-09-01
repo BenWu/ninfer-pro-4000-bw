@@ -64,14 +64,13 @@ constexpr ReductionCriterion kAttentionE8Criterion{
 
 struct Mode {
     const char* name;
-    bool k_packed_i4;
-    bool k_e8_root;
+    KvCacheStorage storage;
     std::int32_t k_extent;
 };
 
 constexpr Mode kModes[] = {
-    {"rk4v4-e8", true, false, kHeadDim / 2},
-    {"rk2v4-e8", false, true, kHeadDim / 4},
+    {"rk4v4-e8", KvCacheStorage::RK4V4E8, kHeadDim / 2},
+    {"rk2v4-e8", KvCacheStorage::RK2V4E8, kHeadDim / 4},
 };
 
 struct Geometry {
@@ -320,11 +319,7 @@ public:
         result.block_table   = Tensor(block_table_.data(), DType::I32, {logical_pages_});
         result.head_dim      = kHeadDim;
         result.num_kv_heads  = geometry_.kv_heads;
-        result.dtype         = DType::I8;
-        result.quant_group   = kGroup;
-        result.v_packed_i4   = true;
-        result.k_packed_i4   = mode_.k_packed_i4;
-        result.k_e8_root     = mode_.k_e8_root;
+        result.storage       = mode_.storage;
         return result;
     }
 
@@ -338,11 +333,7 @@ public:
             .block_tables  = direct.block_table.view({logical_pages_, 1}),
             .head_dim      = direct.head_dim,
             .num_kv_heads  = direct.num_kv_heads,
-            .dtype         = direct.dtype,
-            .quant_group   = direct.quant_group,
-            .v_packed_i4   = direct.v_packed_i4,
-            .k_packed_i4   = direct.k_packed_i4,
-            .k_e8_root     = direct.k_e8_root,
+            .storage       = direct.storage,
         };
     }
 
@@ -390,7 +381,7 @@ public:
                     const float v_scale = f16_bits_to_f32(v_scales[scale_offset]);
 
                     std::array<float, kGroup> k_rotated{};
-                    if (mode_.k_e8_root) {
+                    if (mode_.storage == KvCacheStorage::RK2V4E8) {
                         // Eight consecutive (root, radius/axis) byte pairs per 64-dimension group.
                         for (int block = 0; block < 8; ++block) {
                             const std::int32_t base = group * (kGroup / 4) + 2 * block;
@@ -597,7 +588,7 @@ int run_append_case(const Geometry& geometry, const Mode& mode, const AttentionC
     const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                          test_case.envelope_max};
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), DType::I8, envelope, 1, test_case.tokens, test_case.tokens);
+        op_geometry(geometry), cache.view().storage, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -671,7 +662,7 @@ int run_cached_case(const Geometry& geometry, const Mode& mode, const AttentionC
     const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                          test_case.envelope_max};
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), DType::I8, envelope, 1, test_case.tokens, test_case.tokens);
+        op_geometry(geometry), cache.view().storage, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 

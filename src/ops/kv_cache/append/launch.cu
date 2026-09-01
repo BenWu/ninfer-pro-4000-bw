@@ -51,10 +51,12 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    if (cache.storage == KvCacheStorage::Int8Group64) {
+    if (cache.storage == KvCacheStorage::Int8Group64 ||
+        cache.storage == KvCacheStorage::RK4V4E8 || cache.storage == KvCacheStorage::RK2V4E8) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
-        if (cache.k_e8_root || cache.k_packed_i4) {
+        if (cache.storage == KvCacheStorage::RK4V4E8 ||
+            cache.storage == KvCacheStorage::RK2V4E8) {
             // E8 code planes (RK4V4E8: packed-4-bit lattice K, RK2V4E8: E8 root-cylinder K) are U8;
             // both keep the per-group FP16 K/V scales and H64-rotate K and V before quantization.
             constexpr int TokensPerTile = 8;
@@ -90,7 +92,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                             static_cast<__half*>(cache_v_scale.data), tokens);
                 }
             };
-            if (cache.k_e8_root) {
+            if (cache.storage == KvCacheStorage::RK2V4E8) {
                 fill.template operator()<false, true>();
             } else {
                 fill.template operator()<true, false>();

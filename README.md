@@ -45,14 +45,21 @@ write-ups in `docs/plans/`.
 context measured below. Everything is env-overridable (`CTX`, `PORT`, `DEVICE`, `KV_DTYPE`,
 `MAX_CONCURRENCY`, `VISION=0`, `MTP=0`) and extra flags pass through to the server.
 
-Largest `--max-context` that starts, NVFP4 weights with NVFP4 KV at `--max-concurrency 1`:
+With `CTX` unset the script derives the context from the feature combination. Largest
+`--max-context` that starts, NVFP4 weights with NVFP4 KV at `--max-concurrency 1`, next to the
+value the script picks:
 
-| config | max context | slack at that context |
-|---|---|---|
-| plain | 196608 | 109 MiB |
-| `--vision` | 131072 | 307 MiB |
-| MTP3 | 131072 | 266 MiB |
-| `--vision` + MTP3 | **90112** | 75 MiB |
+| config | ceiling | script default | slack at the default |
+|---|---|---|---|
+| plain | 200704 (37 MiB) | 196608 | 109 MiB |
+| `--vision` | 147456 (17 MiB) | 139264 | 161 MiB |
+| MTP3 | 139264 (113 MiB) | 131072 | 266 MiB |
+| `--vision` + MTP3 | **90112** (75 MiB) | 81920 | 228 MiB |
+
+Every value in both columns is a context that actually started; the defaults are one step below the
+ceiling so there is room for a larger media payload or a different driver state. The table only
+holds for NVFP4 KV at concurrency 1, and the script refuses to guess outside that, asking for an
+explicit `CTX` instead.
 
 Cost of each feature before KV is allocated: vision 282 MiB, MTP3 771 MiB. MTP3 is the expensive
 one, at nearly three times vision, because of its recurrent draft state.
@@ -63,8 +70,11 @@ state, and 81920 keeps 228 MiB. Note that `--max-concurrency` lowers every numbe
 the context-cache defaults scale off it, with device-state slots equal to concurrency, private
 continuations at twice that, and shared prefixes at one times.
 
-A ladder that steps by 32768 reports 65536 for the vision plus MTP3 row, because 98304 misses by
-only 82 MB. The real ceiling is 38% higher, so probe the gap rather than trusting a coarse sweep.
+Two measurement notes for anyone repeating this. A ladder that steps by 32768 reports 65536 for the
+vision plus MTP3 row, because 98304 misses by only 82 MB; the real ceiling is 38% higher, so probe
+the gap rather than trusting a coarse sweep. And back-to-back probes need to wait for the previous
+server to release its device memory, otherwise the next one fails with "free before loading
+weights", which looks like a capacity limit and is not one.
 
 ### Running the tests
 

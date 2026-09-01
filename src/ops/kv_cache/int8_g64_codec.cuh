@@ -180,7 +180,7 @@ namespace detail {
 // registered first and reports "Duplicate entry kernels named ... detected". A binary that
 // links the ops archive whole - every op test does - pulls in both prompt.cu and small_t.cu and
 // hangs on the launch. With `static`, each TU gets its own entry and there is nothing to
-// collide (the same rule the debug scanner in e8_debug_scan.cuh relies on).
+// collide.
 template <int QHeads>
 static __global__ void kv_cache_inverse_rotate_output_kernel(
     __nv_bfloat16* output, int width, int full_width, int column_begin,

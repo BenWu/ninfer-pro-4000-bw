@@ -168,6 +168,111 @@ New storage modes land in this closed set of places (verified symbols):
 - Decode tax ≤ ~6%, prefill within ~2% vs the *local* INT8 baseline (not the fork's absolute
   numbers — 672 GB/s may show a larger tax than at 1008 GB/s).
 
+### B.3 results (PRO 4000, 2026-09-01, branch `cherry/e8-kv`, device 1, ECC on)
+
+Every INT8 figure below is a control measured in the same session as the E8 rows it is
+compared against, not a quote from the D.1 table. This matters: the D.1 numbers predate the
+two E8 commits, and the 32K prefill shape turned out to vary 2.6% run to run.
+
+**Capacity at 262144. Pass, with more room than expected.**
+
+| dtype | 262144 startup | planned slack | KV payload |
+|---|---|---|---|
+| int8 | rejected: needs 8.57 GiB runtime reservation, 7.00 GiB available | n/a | n/a |
+| rk4v4-e8 | starts | 2.43 GiB | 4.25 GiB |
+| rk2v4-e8 | starts | 3.43 GiB | 3.25 GiB |
+
+The fork reference was 1.37 GiB and this section expected ~1.0 GiB after ECC. Both modes clear
+that by 2.4x to 3.4x.
+
+**Retrieval. Pass, 8 of 8 exact.**
+
+All runs return `ORCHID=493817; COLOR=COBALT` on the frozen `long_niah_*` fixtures: both E8
+modes at 64K, 128K and 256K, plus INT8 controls at 64K and 128K.
+
+INT8 cannot run the 256K fixture at all. Its starting KV ceiling is 196608 and the prompt is
+260,096 tokens, so the two E8 256K passes are a capability INT8 does not have on this card,
+not a speed comparison.
+
+The 5-needle @118K case named in the gate above was not run: no such fixture exists in this
+tree or in the ninfer-4090 fork. The requirement was carried over from a protocol description,
+not from a runnable input. Either author the fixture or drop the line.
+
+**Decode tax. rk4v4 passes everywhere; rk2v4 passes at 32K and fails at 128K.**
+
+| context | int8 | rk4v4-e8 | rk2v4-e8 |
+|---|---|---|---|
+| 32K (median of 3) | 31.00 tok/s | 30.89 (0.36%) | 30.78 (0.71%) |
+| 64K needle | 27.34 tok/s | 27.18 (0.6%) | 26.03 (4.8%) |
+| 128K needle | 24.77 tok/s | 24.72 (0.2%) | 22.85 (**7.7%**) |
+
+The 32K row alone would have passed both modes comfortably, but it is the least informative
+shape: decode there is dominated by streaming 15.92 GiB of weights and the KV cache is at most
+1 GiB of traffic, so it measures whether the dequant path stalls, not what it costs in
+bandwidth. The gate has to be read at long context, and there rk2v4 grows past the 6% budget
+while rk4v4 stays flat.
+
+**Prefill. Fails at every length, and the gap widens with context.**
+
+Two independent fixture families, same result.
+
+| length | int8 | rk4v4-e8 | rk2v4-e8 |
+|---|---|---|---|
+| `long_prompt_32tok`, median of 3 | 1040.6 tok/s | 989.8 (4.9%) | 948.5 (8.8%) |
+| `long_prompt_64tok` | 941.1 tok/s | 882.9 (6.2%) | 827.9 (12.0%) |
+| `long_prompt_128tok` | 811.1 tok/s | 726.5 (10.4%) | 655.5 (21.9%) |
+| `long_niah_64k` | 957.0 tok/s | 873.9 (8.7%) | 816.5 (14.7%) |
+| `long_niah_128k` | 797.3 tok/s | 712.6 (10.6%) | 642.0 (19.5%) |
+
+The trend is monotonic in both modes across both fixture families, and the E8 runs repeat to
+within 0.5% while INT8 is the noisy arm, so this is not measurement error. The shape points at
+per-key decode work scaling with key-tile count, with rk2v4 costing roughly double rk4v4,
+which matches root-cylinder decode being more work per key than a nibble unpack.
+
+**Verdict.** Capacity and correctness pass decisively. Prefill misses the ~2% gate outright.
+rk4v4-e8 meets the decode gate at every context measured; rk2v4-e8 does not past ~64K. Whether
+a ~10% prefill cost is worth 256K of otherwise unreachable context is a product call, not a
+measurement one, and the gate as written does not answer it.
+
+**Status of the two modes.** `rk4v4-e8` is the supported mode and the one to judge the port by.
+`rk2v4-e8` stays in the tree but ships with a disclaimer: it is correct at every context tested
+(retrieval is exact through 256K) and it buys about 1 GiB more slack, but it exceeds the 6%
+decode budget past roughly 64K and costs about twice rk4v4-e8's prefill throughput at every
+length. Use it only when the extra GiB is worth those costs. It is not being optimized; see the
+performance note below for why the costs are structural rather than a bug.
+
+**Why the E8 prefill gap widens with context, and why rk2v4-e8 is worse.** Not investigated
+with a profiler; this is what the read path implies, recorded so nobody re-derives it.
+
+The INT8 path stages key codes straight into the QK arena with cp.async and never decodes. Both
+E8 modes decode the staged key tile on every visit, and a key tile is visited once per query
+block, so total decode work grows with the number of (query block, key block) pairs, which is
+quadratic in prompt length while the rest of prefill is linear. That alone explains a relative
+penalty that grows with context, and it applies to rk4v4-e8 too (4.9% at 32K to 10.4% at 128K).
+There is no reuse across query blocks to exploit; the decoded tile is CTA-local.
+
+rk2v4-e8 carries a larger constant into that same quadratic term, from two places in
+`e8_root_decode_8d_fast` (`src/ops/kv_cache/e8_root_codec.cuh`):
+
+- `c_e8_stage1_i8x8` is `__device__ const`, so it lives in global memory and is read with
+  `__ldg`. The root code differs per lane, making every lookup a divergent gather over a 2 KB
+  table. There are 32 such calls per key row (four 64-dimension groups, eight 8-dimension
+  blocks each), plus a second divergent index into `c_axis_i8x8`, which is `__constant__` and
+  therefore also serializes when lanes disagree.
+- Each decoded dimension costs an FP32 multiply and round,
+  `__float2int_rn(float(dir) * c_radius_scale[rad])`, which is 256 per key row. The rk4v4-e8
+  nibble unpack is shifts and masks with no float work at all.
+
+Store cost is not the differentiator: both modes write the swizzled arena one byte at a time
+through `causal_prompt_i8_store_swz`.
+
+If rk2v4-e8 ever becomes worth optimizing, the cheapest thing to try first is staging the 2 KB
+stage-1 table into shared memory once per CTA, which turns the divergent global gather into a
+bank-conflict cost. Folding the radius scale away is harder: it varies per 8-dimension block,
+so it cannot be absorbed into the per-group quantization scale.
+
+Reproduce with the scripts recorded alongside this section; every command pins `--device 1`.
+
 ---
 
 ## Workstream C — MTP3 fit on 24 GB (draft WS3; now a fit test, not a port)

@@ -296,6 +296,9 @@ set_tests_properties(
 ninfer_add_op_test(ninfer_e8_root_codec_test
   SOURCES ops/test_e8_root_codec.cu
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_kv_cache_append_e8_test
+  SOURCES ops/test_kv_cache_append_e8.cu
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
   LIBRARIES ninfer_ops)

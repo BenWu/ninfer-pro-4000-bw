@@ -2,6 +2,186 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
+---
+
+## Fork note: RTX PRO 4000 Blackwell port
+
+Upstream targets the RTX 5090; this fork runs on an **RTX PRO 4000 Blackwell**
+(sm_120a, 70 SM, 24467 MiB usable with ECC on, CUDA 13.3, driver 610.57.04) and ports the E8
+lattice KV cache quantization from the ninfer-3090/4090 forks. Two new KV dtypes:
+`rk4v4-e8` (supported) and `rk2v4-e8` (kept with a disclaimer, see below).
+
+Full detail lives in `docs/plans/rtx-pro-4000-sm120-port-plan.md` and
+`docs/plans/e8-kv-port-handoff-2026-08-31.md`. This section is the overview.
+
+### Status
+
+Working. The engine produces correct text in both E8 modes at every context up to 262144, under
+CUDA Graphs, with and without MTP3 speculative decoding.
+
+### What changed on this branch
+
+Five defects were found and fixed in the E8 attention path. None were in the E8 encoder math.
+
+| Defect | Effect |
+|---|---|
+| `prompt_e8.cuh` decoded 16 of 64 staged key rows | all-zero tokens |
+| `small_t_e8.cuh` wrote FP16 bit patterns into a BF16 tile | NaN via inf residual into RMSNorm |
+| V dequant stored 4-byte values at 2-byte strides | misaligned address fault |
+| `kv_cache_inverse_rotate_output_kernel` lacked `static` | duplicate kernel registration, launch hang |
+| full-mask `__shfl_sync` under a non warp-uniform causal branch | hang on roughly every odd-length prompt |
+
+The last one is the interesting one: sixteen chunks per key row against 32 lanes puts two key rows
+in one warp, so the causal test is not warp uniform and the shuffle deadlocks. It is guarded now
+by an explicit parity pair in the attention test (`{17,0,17}` even against `{17,1,18}` odd).
+
+Also on this branch: per-plane leading extents in `d256_profile.h`, new op tests, a fixture
+generator (`tools/gen_niah_fixtures.py`), four new long-context fixtures, and the measurement
+write-ups in `docs/plans/`.
+
+### Running the tests
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build -j
+CUDA_VISIBLE_DEVICES=1 ctest --test-dir build --output-on-failure
+```
+
+98 of 100 pass. The two failures are pre-existing and unrelated to this port:
+`ninfer_qwen3_6_frontend_test` aborts on a tokenizer path that does not exist on this machine, and
+`ninfer_sliding_window_attention_test` misses its reduction criterion at T=8/V=8/L=96.
+
+E8-specific targets, all passing:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 ./build/tests/ninfer_e8_root_codec_test        # encoder, warp vs scalar
+CUDA_VISIBLE_DEVICES=1 ./build/tests/ninfer_kv_cache_append_e8_test   # append planes, byte exact
+CUDA_VISIBLE_DEVICES=1 ./build/tests/ninfer_softmax_attention_test    # includes causal_cache_e8
+```
+
+`NINFER_OP_REPORT_STATS=1` dumps measured error for every comparison, which is how the tolerance
+in the attention test was set. Note `ninja` does not always rebuild `small_t.cu` / `prompt.cu` when
+an included `.cuh` changes; delete those `.o` files to force it.
+
+### Measurements
+
+Every number below is **Qwen3.8-27B**, artifact `models/qwen3_8_27b.ninfer` (`groupwise-int`,
+15.92 GiB resident), on device 1 with ECC on, unless the NVFP4 subsection says otherwise. The
+NVFP4 rows use `models/qwen3_8_27b_nvfp4.ninfer` (same model, `nvfp4` weights, 18.98 GiB
+resident). None of the other supported checkpoints were measured on this card, so do not carry
+these numbers to Qwen3.6-27B or Qwen3.6-35B-A3B.
+
+Baseline for comparison: int8 KV, 31.00 tok/s decode, 196608 max starting context.
+
+**Capacity.** E8 buys context that int8 cannot reach.
+
+| dtype | max context | slack | with MTP3 |
+|---|---|---|---|
+| int8 | 196608 | 799 MiB | 131072 |
+| rk4v4-e8 | >= 262144 | 2.43 GiB | 262144 |
+| rk2v4-e8 | >= 262144 | 3.43 GiB | 262144 |
+
+**Decode throughput, tok/s.** Single stream, greedy, no speculation. Absolute numbers first,
+tax against same-session int8 in parentheses. rk4v4-e8 is effectively free; rk2v4-e8 is not, at
+long context.
+
+| context | int8 | rk4v4-e8 | rk2v4-e8 |
+|---|---|---|---|
+| 32K | **31.00** | 30.89 (0.36%) | 30.78 (0.71%) |
+| 64K | **27.34** | 27.18 (0.6%) | 26.03 (4.8%) |
+| 128K | **24.77** | 24.72 (0.2%) | 22.85 (**7.7%**) |
+| 256K | n/a | 20.86 | 18.27 |
+
+The 32K row is the median of three runs at 32768 capacity. The 64K and 128K rows come from needle
+runs with the context matched to the prompt. The 256K row was measured under a 262144 reservation
+and has no int8 entry because int8 cannot hold a 260096 token prompt on this card. Reservation
+size affects decode, so compare rows within a row, not across.
+
+**Decode with MTP3, tok/s.** `--spec mtp --draft-tokens 3 --lm-head-draft`. Roughly 1.7x to 1.8x
+over unspeculated decode.
+
+| context | int8 | rk4v4-e8 | rk2v4-e8 |
+|---|---|---|---|
+| 32K | **55.83** | 51.79 | 53.98 |
+| 111K | **47.99** | 47.74 | 42.03 |
+
+The 32K row is a single run per dtype and its spread tracks per-run acceptance variation
+(58.3 / 51.4 / 55.4%), so do not read the ordering there as a property of the codec. The 111K row
+is the reliable one: 512 generated tokens, acceptance 60.9 / 60.9 / 54.6%.
+
+**Prefill tax vs int8.** Both modes miss the plan's 2% gate, and the gap grows with context.
+
+| context | int8 | rk4v4-e8 | rk2v4-e8 |
+|---|---|---|---|
+| 32K | **1040.6** | 989.8 (4.9%) | 948.5 (8.8%) |
+| 64K | **941.1** | 882.9 (6.2%) | 827.9 (12.0%) |
+| 128K | **811.1** | 726.5 (10.4%) | 655.5 (21.9%) |
+
+The cause is structural. int8 stages key codes with cp.async and never decodes; E8 decodes the
+staged tile on every visit, and a tile is visited once per query block, so decode work grows with
+the number of (query block, key block) pairs while the rest of prefill grows linearly.
+
+**Retrieval.** Exact on both E8 modes at 111K single needle and 118K five needle, matching int8.
+These fixtures withhold the answer from the question. The committed `long_niah_*` fixtures do not:
+they end with `Return exactly: ORCHID=...`, so passing them is output stability, not retrieval.
+
+**CUDA Graphs.** 15 of 15 graph vs `--no-cuda-graph` comparisons identical across five frontier
+ranges, plus 9 of 9 on NVFP4 weights and 3 of 3 at a 20K frontier. Ordinary decode profiles only;
+the MTP and dflash profile families are not qualified for E8.
+
+**MTP3.** Fits at 262144 on both E8 modes with no fallback levers. Acceptance at 111K over 512
+generated tokens: int8 60.89%, rk4v4-e8 60.89%, rk2v4-e8 54.56%. rk4v4-e8 has no acceptance
+penalty. The plan's reference band of ~78% from the 4090 fork does not reproduce here at any KV
+dtype, including int8, so it should be requalified or dropped.
+
+**NVFP4 weights** (`models/qwen3_8_27b_nvfp4.ninfer`). A real trade rather than an upgrade.
+The NVFP4 artifact is *larger* here (18.98 GiB resident against 15.92), so every context ceiling
+roughly halves, while prefill runs
+about 2.4x faster. The E8 prefill tax doubles under it (rk4v4-e8 8.7% to 17.0% at 64K) because
+the fixed per-key decode cost stops being amortized. With NVFP4 weights `rk2v4-e8` is the only
+mode that still reaches 262144.
+
+| | groupwise-int | nvfp4 |
+|---|---|---|
+| weights resident | 15.92 GiB | 18.98 GiB |
+| max context, rk4v4-e8 | >= 262144 | 196608 |
+| prefill @64K, int8 | 957 tok/s | 2280 tok/s |
+
+NVFP4 decode, tok/s, from the needle runs at matched context. Close to the groupwise numbers
+despite 19% more weight bytes to stream, which is not explained here. `n/a` means the dtype
+cannot hold that prompt with these weights.
+
+| context | int8 | rk4v4-e8 | rk2v4-e8 |
+|---|---|---|---|
+| 8K | 28.90 | 28.73 | 28.51 |
+| 64K | 26.67 | 26.48 | 25.14 |
+| 128K | n/a | 23.87 | 22.08 |
+| 256K | n/a | n/a | 17.72 |
+
+**Context-cost presets.** `models/context_cost_presets.json` holds the measured prefill model
+for `qwen3.8-27b` / `groupwise-int` under hardware class
+`nvidia-rtx-pro-4000-blackwell-sm120`
+(0.017 validation error against a 0.15 limit). The device-to-device transfer fit is rejected by
+the tool's own limit (0.35 against a 0.365 p95) and is not sampling noise: 5x the samples moved it
+to 0.349 with the same ordering failure. Serving falls back to generic transfer costs. Building
+the calibrator needs `-DNINFER_BUILD_BENCHMARKS=ON`.
+
+### Known limits
+
+- `rk2v4-e8` ships with a disclaimer. It is correct everywhere tested, and with NVFP4 weights it
+  is the only route to 262144, but it exceeds the 6% decode budget past roughly 64K and costs
+  about twice rk4v4-e8's prefill. It is not being optimized. The likely costs are a divergent
+  gather over a 2 KB `__device__ const` table and 256 FP32 convert/round operations per key row,
+  neither of which rk4v4-e8 pays.
+- The prefill gate fails for both modes and is structural, not a bug.
+- The `examples/cli/messages/long_niah_*.json` fixtures state their answers in the question.
+- MTP and dflash CUDA Graph profile families are unqualified for E8.
+- Unexplained and unpursued: NVFP4 decode is flat despite 19% more weight bytes to stream, and the
+  d2d transfer roofline does not fit this card.
+- Serving extras (plan D.2: `/metrics`, `timings`, `context_window`) are not started.
+
+---
+
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
 OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one

@@ -185,18 +185,26 @@ two E8 commits, and the 32K prefill shape turned out to vary 2.6% run to run.
 The fork reference was 1.37 GiB and this section expected ~1.0 GiB after ECC. Both modes clear
 that by 2.4x to 3.4x.
 
-**Retrieval. Pass, 8 of 8 exact.**
+**Long-context output stability. Pass, 8 of 8 exact. Read this as stability, not retrieval.**
 
 All runs return `ORCHID=493817; COLOR=COBALT` on the frozen `long_niah_*` fixtures: both E8
 modes at 64K, 128K and 256K, plus INT8 controls at 64K and 128K.
+
+The caveat matters. Every `long_niah_*` fixture ends with `... Return exactly: ORCHID=493817;
+COLOR=COBALT`, so the expected answer is stated verbatim in the question and the model does not
+have to attend to the planted needle to produce it. What these runs actually prove is that at up
+to 260K context the engine emits the exact expected tokens instead of garbage, which is a real
+and relevant gate here since the failure modes this port was chasing were all-zero tokens, NaN
+and hangs. They are not evidence of retrieval quality at long context. A fixture that withholds
+the answer is needed for that.
 
 INT8 cannot run the 256K fixture at all. Its starting KV ceiling is 196608 and the prompt is
 260,096 tokens, so the two E8 256K passes are a capability INT8 does not have on this card,
 not a speed comparison.
 
-The 5-needle @118K case named in the gate above was not run: no such fixture exists in this
+The 5-needle @118K case named in the gate above was not run: no such fixture existed in this
 tree or in the ninfer-4090 fork. The requirement was carried over from a protocol description,
-not from a runnable input. Either author the fixture or drop the line.
+not from a runnable input.
 
 **Decode tax. rk4v4 passes everywhere; rk2v4 passes at 32K and fails at 128K.**
 
@@ -273,6 +281,42 @@ so it cannot be absorbed into the per-group quantization scale.
 
 Reproduce with the scripts recorded alongside this section; every command pins `--device 1`.
 
+### Decode CUDA Graph qualification (2026-09-01, groupwise-int weights)
+
+`Variant::ordinary_graph_profiles` cuts the decode frontier into ranges ending at
+127/511/2047/4095/8197/16389/32767 and captures one graph per range. The boundaries were chosen
+against the INT8 attention split policy, and a graph fixes kernel and launch geometry at capture
+time, so the open question for E8 was whether a captured graph stays correct across its whole
+range. Answer: yes, on every range reachable here.
+
+Method: same prompt, `--greedy`, run once normally and once with `--no-cuda-graph`, generated text
+compared byte for byte. `--no-cuda-graph` really does disable capture, confirmed by the startup
+report (`CUDA Graph allowance` 12.00 MiB with graphs, 0 B without). Decode throughput is within
+noise between the two because at ~33 ms per token launch overhead is about 1% of the budget, so
+the speeds are not evidence either way; the text comparison is.
+
+| shape | input | decode frontier | generated |
+|---|---|---|---|
+| A | short prompt, 512 new | 0-127, 128-511, into 512-2047 | 512 tokens |
+| B | short prompt, 2100 new | crosses 2047/2048 | 1983 tokens |
+| C | `long_niah_8k`, 128 new | around 8197 | 17 tokens |
+| D | `long_prompt_32tok`, 128 new | 16390-32767 | 2 tokens |
+| E | `long_niah_64k`, 128 new | 32768+ | 17 tokens |
+
+All 15 combinations (int8, rk4v4-e8, rk2v4-e8 crossed with the five shapes) produced identical
+output with and without graphs. INT8 is the control: it is the dtype the boundaries were tuned
+for, so a difference there would have meant a harness fault rather than an E8 one.
+
+Weight the shapes unequally. B is the real evidence, at 8599 bytes of greedy text matching
+exactly across a boundary crossing; A is next at 2238 bytes. C and E are 17 tokens of needle
+answer, enough to catch a wrong answer but not a subtle drift. D generates two tokens because its
+fixture only ever answers `OK`, so it shows the 16390-32767 range executes without error and
+nothing more. If that range needs real coverage, it wants a fixture that generates prose at a
+~20K frontier.
+
+Not covered: the MTP and dflash profile families (`mtp_graph_profiles`, `dflash_graph_profiles`),
+which have their own boundaries and topology classes. This pass is ordinary decode only.
+
 ---
 
 ## Workstream C — MTP3 fit on 24 GB (draft WS3; now a fit test, not a port)
@@ -291,6 +335,66 @@ fits after weights on this card:
    ships as the default profile.
 4. Exit gate: MTP3 starts at the chosen profile; acceptance within ±3 pt of the fork's ~78%
    band at 111K; single-stream correctness unchanged with MTP off→on.
+
+### Workstream C results (PRO 4000, 2026-09-01, groupwise-int weights, device 1, ECC on)
+
+**Step 1, available after weights.** 7.28 GiB with the groupwise artifact (3.94 GiB with nvfp4,
+see D.3). ECC could not be disabled: the host has no root, so every number here is ECC-on.
+
+**Step 2, MTP3 fits at the target context on both E8 modes.** All runs use
+`--spec mtp --draft-tokens 3 --lm-head-draft`.
+
+| dtype | max context with MTP3 | without MTP3 | slack | KV payload |
+|---|---|---|---|---|
+| int8 | 131072 | 196608 | 1.47 GiB | 4.38 GiB |
+| rk4v4-e8 | **262144** | >= 262144 | 1.34 GiB | 4.52 GiB |
+| rk2v4-e8 | **262144** | >= 262144 | 2.40 GiB | 3.45 GiB |
+
+**Step 3, no levers needed.** `--device-state-slots`, `--host-state-slots`, `--host-kv-mib`,
+lower `--max-concurrency` and `--draft-tokens 2` exist for the case where MTP3 does not fit at
+the target. It does. The shipping profile is `rk4v4-e8` at 262144 with MTP3 and no compromises.
+Only int8 pays, dropping to 131072 because its KV payload leaves no room for the draft state.
+
+**Step 4, exit gate.** Two halves, and the acceptance half needs its reference restated.
+
+*Acceptance.* Measured on `long_decode_111k.json`, a 111,187-token document with a generative
+question and 512 new tokens. A needle fixture cannot measure this: its answer is ten tokens,
+which is two trivially predictable draft rounds and reads as a meaningless 100%.
+
+| dtype | acceptance | tok/round | decode |
+|---|---|---|---|
+| int8 | 60.89% | 2.82 | 47.99 tok/s |
+| rk4v4-e8 | 60.89% | 2.82 | 47.74 tok/s |
+| rk2v4-e8 | 54.56% | 2.63 | 42.03 tok/s |
+
+The gate's "±3 pt of the fork's ~78% band" cannot be met, and not because of E8: the **int8
+control lands 17 points below that band**. The fork's number came from different hardware and
+probably a different workload, and it does not reproduce here at any KV dtype. Three independent
+measurements on this machine cluster instead at 57.9% (D.1, 32K), 58.3% (C3, 32K) and 60.9%
+(111K), so the reproducible form of this gate is E8 against same-machine int8.
+
+On that form `rk4v4-e8` passes outright with **no acceptance penalty at all**. Note the equality
+is a coincidence at the aggregate: the two runs generated different text and different
+per-position acceptance (int8 142/108/80, rk4v4-e8 147/107/76) that happens to sum to the same
+330 of 542. Two different generation paths reaching the same aggregate is better evidence of
+parity than one path measured twice. `rk2v4-e8` gives up 6.3 points of acceptance and 12% of
+decode throughput, consistent with its long-context decode tax recorded under B.3.
+
+*Single-stream correctness, MTP off to on.* All three dtypes produce coherent, correct,
+undegraded prose with MTP enabled, and all three retrieve correctly at 111K with MTP on.
+
+A byte comparison is the wrong test for this gate and cannot pass. With MTP on, the target model
+verifies K+1 tokens in one batched forward pass; with MTP off it runs one token at a time.
+Different batch shapes take different kernel paths, so tiny floating point differences
+occasionally flip an argmax where two tokens are nearly tied. Greedy speculative decoding is
+output-identical to non-speculative decoding only in exact arithmetic. The observed divergences
+are exactly that shape: int8 splits 162 characters in on `storage**` versus `storage
+resources**`, then both continue saying the same thing. This was verified by reading the outputs,
+not inferred.
+
+**Verdict.** Steps 1 to 3 pass cleanly and MTP3 ships at 262144 on rk4v4-e8. Step 4 passes in its
+reproducible form and its absolute form is unreachable for reasons unrelated to this port; the
+fork's ~78% reference should be dropped from the gate or requalified on this hardware.
 
 
 ---
@@ -449,6 +553,65 @@ Download `neroued/Qwen3.8-27B-nvfp4-NInfer`, load on the PRO 4000, compare decod
 the groupwise baseline at equal context, run the same needle gates. The nvfp4 profile is
 resolved from artifact identity; no flag port from any fork.
 
+### D.3 results (PRO 4000, 2026-09-01, `models/qwen3_8_27b_nvfp4.ninfer`, device 1, ECC on)
+
+Every B.3 and graph number above was taken with the groupwise-int artifact. The parts that depend
+on weight residency or on graph topology do not carry over, so they were repeated here. The E8 op
+tests do carry over unchanged: they drive the ops with synthetic tensors and never load weights.
+
+**NVFP4 is the larger artifact on this pair, not the smaller one.**
+
+| | groupwise-int | nvfp4 |
+|---|---|---|
+| weight H2D | 15.92 GiB | 18.98 GiB |
+| free after weights | 7.28 GiB | 3.94 GiB |
+
+That is 3.06 GiB more resident weights and 3.34 GiB less room for everything else, which halves
+the context ceiling of every KV dtype.
+
+**Largest starting context.**
+
+| dtype | groupwise | nvfp4 | slack (nvfp4) | KV payload (nvfp4) |
+|---|---|---|---|---|
+| int8 | 196608 | 98304 | 544 MiB | 3.09 GiB |
+| rk4v4-e8 | >= 262144 | 196608 | 448 MiB | 3.19 GiB |
+| rk2v4-e8 | >= 262144 | 262144 | 384 MiB | 3.25 GiB |
+
+With NVFP4 weights, `rk2v4-e8` is the only configuration on this card that reaches 262144.
+`rk4v4-e8`, the supported mode, stops at 196608. That is worth holding against the disclaimer
+in B.3: rk2v4-e8 is the weaker mode on decode tax and prefill, and it is also the only route to
+the top context on this weight format.
+
+**Long-context output stability: 8 runs, all exact, 3 skips.** 8K and 64K pass on all three
+dtypes; 128K passes on both E8 modes and is out of reach for int8; 256K passes on rk2v4-e8 only.
+Same caveat as B.3, these fixtures state their answer in the question, so this is exact-output
+stability rather than retrieval.
+
+**Prefill is much faster and the E8 tax roughly doubles.** On `long_niah_64k`, the fixture both
+weight formats can run on all three dtypes:
+
+| dtype | groupwise | nvfp4 | E8 tax vs int8 (groupwise -> nvfp4) |
+|---|---|---|---|
+| int8 | 957.0 tok/s | 2280.0 tok/s | n/a |
+| rk4v4-e8 | 873.9 tok/s | 1892.2 tok/s | 8.7% -> 17.0% |
+| rk2v4-e8 | 816.5 tok/s | 1658.3 tok/s | 14.7% -> 27.3% |
+
+NVFP4 moves prefill by about 140%, an order of magnitude more than the KV codec does, so it is
+the lever to pull if prefill throughput is the problem. The E8 penalty doubling is the expected
+consequence of the mechanism described under B.3: E8 key decode is fixed work per key tile, and
+when the surrounding weight math gets 2.4x faster that fixed cost stops being amortized. NVFP4
+and E8 therefore work against each other on prefill while stacking cleanly on capacity.
+
+Decode is close to flat between the formats (26.7 vs 27.3 tok/s for int8 at 64K) despite 19% more
+weight bytes to stream, which is not explained here and was not pursued.
+
+**Decode CUDA Graph differential: 9 of 9 identical** across int8/rk4v4-e8/rk2v4-e8 and shapes
+A/B/C at 16384 context, so the E8 path is graph-safe against NVFP4 weights as well.
+
+**Verdict.** NVFP4 on this card is a real trade rather than an upgrade: about 2.4x prefill against
+half the context ceiling. Which side wins depends on whether the workload is prefill-heavy at
+moderate context or needs the full 262144.
+
 ### D.4 Causal-tile attention (draft WS6) — deferred
 
 Only if prefill hurts after B/C land. Re-derive on the upstream sm_120 schedule
@@ -460,6 +623,45 @@ After baselining, generate a machine preset via the existing calibration path
 (`--context-cost-presets FILE`, format in `src/runtime/engine/context_cost.cpp`) so context
 cache/continuation planning stops using generic conservative costs on this card. This is a
 local-machine override by design — do not compile it into `context_cost_defaults.cpp`.
+
+### D.5 results (PRO 4000, 2026-09-01)
+
+Calibration needs `ninfer_context_cost_bench`, which is gated behind `NINFER_BUILD_BENCHMARKS`
+(default OFF), so the build directory has to be reconfigured with `-DNINFER_BUILD_BENCHMARKS=ON`
+to produce it. Nothing in `src/`, `apps/` or `tools/` calls the upsert entry points; `bench/` is
+the only caller.
+
+**Prefill preset written, transfer preset not.** Result file:
+`models/context_cost_presets.json` (models/ is gitignored, which suits a local-machine override),
+hardware class `nvidia-rtx-pro-4000-blackwell-sm120`, one prefill entry for `qwen3.8-27b`.
+
+The combined `--suite all` run is rejected wholesale, because the preset write only happens when
+every fitted component passes. Three of four passed comfortably:
+
+| component | training p95 | validation p95 | limit | verdict |
+|---|---|---|---|---|
+| prefill | 0.041 | 0.017 | 0.15 | accepted |
+| transfer d2h | 0.098 | 0.055 | 0.35 | accepted |
+| transfer h2d | 0.173 | 0.255 | 0.35 | accepted |
+| transfer d2d | 0.365 | 0.447 | 0.35 | rejected, 1 ordering failure |
+
+Splitting the suites salvages the useful half: `--suite prefill` alone is accepted and writes the
+prefill model, which is the component context planning depends on most and which fits very well
+at 0.017 validation error against a 0.15 limit.
+
+**The device-to-device miss is not sampling noise.** That was the obvious hypothesis, since the
+default is 9 samples per point and two other GPUs are busy on this host, so the transfer suite was
+retried at 25 and then 45 samples with 5 warmups. Training p95 moved 0.365 -> 0.351 -> 0.349 and
+validation stayed at 0.40 to 0.45, with the same single ordering failure every time. Five times
+the sampling changed almost nothing, so the d2d roofline model genuinely does not describe this
+card's behaviour within its own acceptance limit.
+
+The limit was not relaxed to force a pass. It encodes the tool's judgement about when its model is
+trustworthy for planning, and a preset that fails it would make context planning worse than the
+conservative defaults it replaces. Serving therefore runs with the measured prefill model and
+falls back to generic transfer costs, which is the correct outcome rather than a partial failure.
+
+Why the d2d roofline misfits sm_120a was not investigated.
 
 ---
 

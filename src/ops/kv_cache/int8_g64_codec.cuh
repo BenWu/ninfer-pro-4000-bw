@@ -170,10 +170,19 @@ __device__ __forceinline__ void kv_cache_hadamard64(float& x0, float& x1,
     x1            = (a - b) * 0.125f;
 }
 
+namespace detail {
 // Undoes the per-group V rotation after attention: the PV result of a
 // RotateV cache lives in the H64-rotated value space per 64-dimension group.
+//
+// `static` is load-bearing, and a namespace is not a substitute for it. Without internal
+// linkage every translation unit that includes this header emits the same mangled entry, and
+// the relocatable-device-code linker registers each one: the runtime then keeps whichever was
+// registered first and reports "Duplicate entry kernels named ... detected". A binary that
+// links the ops archive whole - every op test does - pulls in both prompt.cu and small_t.cu and
+// hangs on the launch. With `static`, each TU gets its own entry and there is nothing to
+// collide (the same rule the debug scanner in e8_debug_scan.cuh relies on).
 template <int QHeads>
-__global__ void kv_cache_inverse_rotate_output_kernel(
+static __global__ void kv_cache_inverse_rotate_output_kernel(
     __nv_bfloat16* output, int width, int full_width, int column_begin,
     const std::int32_t* valid_columns) {
     const int unit = static_cast<int>(blockIdx.x);
@@ -199,5 +208,6 @@ __global__ void kv_cache_inverse_rotate_output_kernel(
     output[base + d0] = __float2bfloat16(x0);
     output[base + d1] = __float2bfloat16(x1);
 }
+} // namespace detail
 
 } // namespace ninfer::ops

@@ -67,20 +67,21 @@ __device__ __forceinline__ void causal_small_t_e8_decode_key_group(const std::ui
     }
 }
 
-// Decode 4 packed-4-bit value bytes (8 rotated dimensions) into 8 bf16 values (int4 = four half2).
-__device__ __forceinline__ int4 causal_small_t_e8_dequant_f16x8(const std::uint8_t* src4,
-                                                              __half scale) {
-    const __half2 s2 = __halves2half2(scale, scale);
-    int output[4];
+// Decode 4 packed-4-bit value bytes (8 rotated dimensions) into 8 bf16 values (int4 = four
+// bf16x2). The PV stage of this kernel is a bf16 MMA over a bf16 V tile, so the codes must be
+// packed as bf16 pairs exactly like the INT8 path's kv_cache_int8_dequant_i8x8_from; emitting
+// FP16 pairs here would hand mma.bf16 fp16 bit patterns and scramble every value.
+__device__ __forceinline__ int4 causal_small_t_e8_dequant_bf16x8(const std::uint8_t* src4,
+                                                                 float scale) {
+    unsigned output[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const __half2 code2 = __floats2half2_rn(
-            static_cast<float>(kv_cache_unpack_i4(src4[i], 0)),
-            static_cast<float>(kv_cache_unpack_i4(src4[i], 1)));
-        const __half2 value2 = __hmul2(code2, s2);
-        output[i]            = *reinterpret_cast<const int*>(&value2);
+        const float x0 = static_cast<float>(kv_cache_unpack_i4(src4[i], 0)) * scale;
+        const float x1 = static_cast<float>(kv_cache_unpack_i4(src4[i], 1)) * scale;
+        output[i]      = pack_bf16x2(x0, x1);
     }
-    return make_int4(output[0], output[1], output[2], output[3]);
+    return make_int4(static_cast<int>(output[0]), static_cast<int>(output[1]),
+                     static_cast<int>(output[2]), static_cast<int>(output[3]));
 }
 
 // Decode-specialized producer/consumer kernel for T=1..6. One producer warp per
@@ -250,6 +251,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
+    // The E8 append reads physical_pages_s for the page index; the fill loop ran cooperatively
+    // across all threads, so a barrier must order the smem writes before the read (mirrors the
+    // i8 kernel's __syncthreads before its cache-write pass).
+    __syncthreads();
 
     if constexpr (CacheInput::writes_cache) {
         // Fused E8 append: H64-rotate K and V per 64-dimension group, then encode into the packed
@@ -361,8 +366,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         // Stage raw key codes: E8 root keeps 16 bytes per (key row, 64-dim group); packed keeps
         // 8 bytes per (key row, 16 dims). K/V are decoded into the INT8 QK arena / bf16 V tile
         // after the cp.async wait.
-#pragma unroll 1
         if constexpr (E8Root) {
+#pragma unroll 1
             for (int chunk = tid; chunk < Bc * Groups; chunk += Threads) {
                 const int key_l  = chunk / Groups;
                 const int grp    = chunk - key_l * Groups;
@@ -377,6 +382,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 }
             }
         } else {
+#pragma unroll 1
             for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
                 const int key_l  = chunk / (D / 16);
                 const int dc     = chunk - key_l * (D / 16);
@@ -597,8 +603,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
                     vs = __shfl_sync(FullMask, vs, grp * 8);
-                    store_vec(dst, causal_small_t_e8_dequant_f16x8(&v_raw[key_l * (D / 2) + d / 2],
-                                                                    vs));
+                    store_vec(dst, causal_small_t_e8_dequant_bf16x8(
+                                       &v_raw[key_l * (D / 2) + d / 2], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }

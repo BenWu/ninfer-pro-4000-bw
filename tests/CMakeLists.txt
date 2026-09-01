@@ -15,10 +15,23 @@ function(ninfer_add_test name)
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/third_party
     ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
+  # RDC static archives must be linked whole: kernel entry references live in
+  # .cudaubsdata, which the host linker cannot see, so per-symbol archive member
+  # selection silently drops kernel-defining translation units and the runtime
+  # dies with cudaErrorSymbolNotFound.
+  set(whole)
+  set(plain)
   if(arg_LIBRARIES)
-    target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
+    foreach(lib IN LISTS arg_LIBRARIES)
+      if(lib MATCHES "^ninfer_")
+        list(APPEND whole "$<LINK_LIBRARY:WHOLE_ARCHIVE,${lib}>")
+      else()
+        list(APPEND plain ${lib})
+      endif()
+    endforeach()
+    target_link_libraries(${name} PRIVATE ${whole} ${plain})
   else()
-    target_link_libraries(${name} PRIVATE ninfer_core)
+    target_link_libraries(${name} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,ninfer_core>")
   endif()
   if(arg_NEEDS_SOURCE_DIR)
     target_compile_definitions(${name} PRIVATE
@@ -254,6 +267,7 @@ endforeach()
 ninfer_add_op_test(ninfer_softmax_attention_test
   SOURCES ops/softmax_attention/main.cpp
           ops/softmax_attention/causal_cache.cpp
+          ops/softmax_attention/causal_cache_e8.cu
           ops/softmax_attention/plain_and_packed.cpp
           ops/softmax_attention/context.cpp
   LIBRARIES ninfer_ops)
@@ -279,6 +293,9 @@ set_tests_properties(
   ninfer_kv_cache_append_nvfp4_test
   ninfer_kv_cache_append_k8v4_test
   PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_op_test(ninfer_e8_root_codec_test
+  SOURCES ops/test_e8_root_codec.cu
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
   LIBRARIES ninfer_ops)

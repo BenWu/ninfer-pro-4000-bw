@@ -292,45 +292,50 @@ __global__ __maxnreg__(120) void causal_attention_prompt_e8_kernel(
     const float scale_l2 = scale * Log2E;
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
-        if (warp < ProducerWarps) {
-            if constexpr (E8Root) {
-                // Decode this CTA's 16 key rows: one 16-byte chunk per 64-dimension group.
+        // Decode the whole staged key tile into the INT8 QK arena. Every producer warp reads all
+        // Bc rows through ldmatrix, so the decode must cover the tile cooperatively across the
+        // CTA and be published by a barrier before QK runs (the INT8 kernel gets the same
+        // ordering for free because its key codes land in k_i8 directly via cp.async).
+        if constexpr (E8Root) {
+            // One 16-byte chunk per (key row, 64-dimension group).
 #pragma unroll 1
-                for (int chunk = lane; chunk < 16 * Groups; chunk += 32) {
-                    const int key_l = chunk / Groups;
-                    const int grp   = chunk - key_l * Groups;
-                    const int key   = k0 + key_l;
-                    if (key <= max_query_abs) {
-                        causal_prompt_e8_decode_key_group<E8Root>(
-                            &k_raw[key_l * (D / 4) + grp * (D / 4) / Groups], k_i8, key_l,
-                            grp * (D / Groups));
-                    } else {
+            for (int chunk = tid; chunk < Bc * Groups; chunk += kCausalPromptI8Threads) {
+                const int key_l = chunk / Groups;
+                const int grp   = chunk - key_l * Groups;
+                const int key   = k0 + key_l;
+                if (key <= max_query_abs) {
+                    causal_prompt_e8_decode_key_group<E8Root>(
+                        &k_raw[key_l * (D / 4) + grp * (D / 4) / Groups], k_i8, key_l,
+                        grp * (D / Groups));
+                } else {
 #pragma unroll
-                        for (int d = grp * (D / Groups); d < grp * (D / Groups) + D / Groups; ++d) {
-                            causal_prompt_i8_store_swz(k_i8, key_l, d, 0);
-                        }
-                    }
-                }
-            } else {
-                // Decode this CTA's 16 key rows: one 8-byte chunk per 16 dimensions.
-#pragma unroll 1
-                for (int chunk = lane; chunk < 16 * (D / 16); chunk += 32) {
-                    const int key_l = chunk / (D / 16);
-                    const int dc    = chunk - key_l * (D / 16);
-                    const int d     = dc * 16;
-                    const int key   = k0 + key_l;
-                    if (key <= max_query_abs) {
-                        causal_prompt_e8_decode_packed_k16(
-                            &k_raw[key_l * (D / 2) + d / 2], k_i8, key_l, d);
-                    } else {
-#pragma unroll
-                        for (int i = 0; i < 16; ++i) {
-                            causal_prompt_i8_store_swz(k_i8, key_l, d + i, 0);
-                        }
+                    for (int d = grp * (D / Groups); d < grp * (D / Groups) + D / Groups; ++d) {
+                        causal_prompt_i8_store_swz(k_i8, key_l, d, 0);
                     }
                 }
             }
+        } else {
+            // One 8-byte chunk per (key row, 16 dimensions).
+#pragma unroll 1
+            for (int chunk = tid; chunk < Bc * (D / 16); chunk += kCausalPromptI8Threads) {
+                const int key_l = chunk / (D / 16);
+                const int dc    = chunk - key_l * (D / 16);
+                const int d     = dc * 16;
+                const int key   = k0 + key_l;
+                if (key <= max_query_abs) {
+                    causal_prompt_e8_decode_packed_k16(&k_raw[key_l * (D / 2) + d / 2], k_i8,
+                                                       key_l, d);
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        causal_prompt_i8_store_swz(k_i8, key_l, d + i, 0);
+                    }
+                }
+            }
+        }
+        __syncthreads();
 
+        if (warp < ProducerWarps) {
             const int row_base = warp * 16;
             float score[QKNt][4];
 #pragma unroll
@@ -471,27 +476,50 @@ __global__ __maxnreg__(120) void causal_attention_prompt_e8_kernel(
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
                 const int key   = k0 + key_l;
-                __half* dst     = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
+                const int grp   = d >> 6;
+                // Sixteen chunks per key row against 32 lanes puts TWO key rows in one warp:
+                // lanes 0-15 cover the even row, lanes 16-31 the odd one. The causal
+                // `key <= max_query_abs` test below is therefore NOT warp-uniform whenever a
+                // tile's last visible key lands on an even row, so the full-mask scale
+                // broadcast has to happen above that branch - a __shfl_sync under a divergent
+                // branch hangs the kernel, and did (roughly half of all prompt lengths).
+                // A (row, group) scale is loaded by the first lane of its 4-lane quadrant and
+                // broadcast within it, so the shuffle source stays in the same half-warp (same
+                // key row); an out-of-range row still indexes inside v_scale_s.
+                __half vs = __float2half_rn(0.0f);
+                if ((lane & 3) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
+                vs = __shfl_sync(FullMask, vs, lane & ~3);
+                // The 16 codes span two swizzle blocks (swz XOR-permutes 8-half groups). Store
+                // each 8-half block at its own swizzled base; a single linear 16-half run would
+                // skip group 0 for odd (row & 7) rows and overflow the row.
+                __half* d0 = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
+                __half* d1 = &v_f16[key_l * D + causal_prompt_swz(key_l, d + 8)];
                 if (key <= max_query_abs) {
-                    const int grp = d >> 6;
-                    __half vs     = __float2half_rn(0.0f);
-                    if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
-                    vs = __shfl_sync(FullMask, vs, grp * 8);
                     const __half2 s2  = __halves2half2(vs, vs);
                     const auto* src   = &v_raw[key_l * (D / 2) + d / 2];
                     std::int8_t codes[16];
                     kv_cache_unpack_i4x16(src, codes);
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        const __half2 code2 =
+                    for (int i = 0; i < 4; ++i) {
+                        const __half2 value2 = __hmul2(
                             __floats2half2_rn(static_cast<float>(codes[2 * i]),
-                                              static_cast<float>(codes[2 * i + 1]));
-                        const __half2 value2 = __hmul2(code2, s2);
-                        *reinterpret_cast<unsigned*>(&dst[i]) =
+                                              static_cast<float>(codes[2 * i + 1])),
+                            s2);
+                        *reinterpret_cast<unsigned*>(d0 + 2 * i) =
+                            *reinterpret_cast<const unsigned*>(&value2);
+                    }
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const __half2 value2 = __hmul2(
+                            __floats2half2_rn(static_cast<float>(codes[8 + 2 * i]),
+                                              static_cast<float>(codes[8 + 2 * i + 1])),
+                            s2);
+                        *reinterpret_cast<unsigned*>(d1 + 2 * i) =
                             *reinterpret_cast<const unsigned*>(&value2);
                     }
                 } else {
-                    store_vec(dst, make_int4(0, 0, 0, 0));
+                    store_vec(d0, make_int4(0, 0, 0, 0));
+                    store_vec(d1, make_int4(0, 0, 0, 0));
                 }
             }
         }

@@ -19,6 +19,26 @@ Full detail lives in `docs/plans/rtx-pro-4000-sm120-port-plan.md` and
 Working. The engine produces correct text in both E8 modes at every context up to 262144, under
 CUDA Graphs, with and without MTP3 speculative decoding.
 
+### Two card routing
+
+`tools/router/` fronts this card and an RTX 4090 running the ninfer-4090 fork with one endpoint,
+deciding which card each request goes to. Both `/v1/chat/completions` and `/v1/messages` are
+routed, queued and streamed.
+
+It exists for two measured reasons, neither of which is the prefill and decode asymmetry between
+the cards. A prefix cache hit turns a cold 32k prefill from 10.98s into 0.10s, so affinity is
+worth more than any placement preference. And both servers run one request at a time, so a short
+call arriving behind a cold long prefill waited 11.64s against 0.60s idle, which raising
+`--max-concurrency` does not fix at any level.
+
+Measured across both cards, mean time to first token for one cold 32k prefill followed by six
+short calls: 12.19s on this card alone, 6.52s round robin, 1.82s routed. On two long documents
+with follow up turns, round robin comes out worse than a single card, because it splits each
+conversation across both and destroys the affinity one card gets for free.
+
+See [`tools/router/README.md`](tools/router/README.md) for the cost model, the measured
+coefficients for both cards, and how to calibrate a backend.
+
 ### What changed on this branch
 
 Five defects were found and fixed in the E8 attention path. None were in the E8 encoder math.

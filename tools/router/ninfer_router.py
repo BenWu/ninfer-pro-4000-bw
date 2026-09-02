@@ -18,7 +18,7 @@ Shape only breaks ties between backends that are equally warm and equally idle.
 Usage:
     python3 tools/router/ninfer_router.py --port 8090 \
         --backend blackwell=http://127.0.0.1:8080,max_context=81920,prefill=3860,decode=57.4,attn=2.493e-9 \
-        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9
+        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,affinity_slots=1
 """
 import argparse
 import collections
@@ -37,9 +37,13 @@ from http.server import BaseHTTPRequestHandler
 # token, so dividing by 3 overestimates and errs toward the larger context.
 CHARS_PER_TOKEN = 3.0
 
-# Roughly the measured retention of one card at --max-concurrency 1: two private
-# continuations plus one shared prefix. Tracking more would promise hits the
-# server cannot honour.
+# How many contexts a card holds. The two forks differ, so this is per backend.
+# The Blackwell fork's context cache derives two private continuations plus one
+# shared prefix at --max-concurrency 1, and alternating two documents does keep
+# both. The 4090 fork has no such cache: its reuse is a retained-sequence check,
+# and it holds exactly one context. Alternating two 4000 word documents there,
+# a repeat costs 27.8ms while every alternation pays the full 7.85s prefill.
+# Tracking more slots than a card has promises hits it cannot honour.
 AFFINITY_SLOTS = 3
 
 # Retention is a cost model decision inside the engine, not a fixed rule, so this
@@ -54,7 +58,8 @@ AFFINITY_MIN_TOKENS = 2048
 
 class Backend:
     def __init__(self, name, url, max_context, prefill_tok_s, decode_tok_s,
-                 affinity_min_tokens=AFFINITY_MIN_TOKENS, attention_s_per_token2=0.0):
+                 affinity_min_tokens=AFFINITY_MIN_TOKENS, attention_s_per_token2=0.0,
+                 affinity_slots=AFFINITY_SLOTS):
         self.name = name
         self.url = url.rstrip("/")
         self.max_context = max_context
@@ -69,6 +74,7 @@ class Backend:
         self.prefixes = collections.OrderedDict()   # prefix hash -> token estimate
         self.stats = collections.Counter()
         self.affinity_min_tokens = affinity_min_tokens
+        self.affinity_slots = max(1, affinity_slots)
         # Estimated work already committed to this backend. Counting jobs and
         # multiplying by an average badly misprices a queue whose jobs differ by
         # more than an order of magnitude, which is exactly the traffic here:
@@ -90,7 +96,7 @@ class Backend:
             return
         self.prefixes.pop(digest, None)
         self.prefixes[digest] = tokens
-        while len(self.prefixes) > AFFINITY_SLOTS:
+        while len(self.prefixes) > self.affinity_slots:
             self.prefixes.popitem(last=False)
 
     def warm_tokens(self, hashes):
@@ -264,7 +270,7 @@ class Router:
             return {b.name: {"url": b.url, "queued": b.queued,
                              "pending_seconds": round(b.pending_seconds, 3),
                              "max_context": b.max_context,
-                             "warm_prefixes": len(b.prefixes),
+                             "warm_prefixes": f"{len(b.prefixes)}/{b.affinity_slots}",
                              "routed": dict(b.stats)} for b in self.backends}
 
 
@@ -413,7 +419,8 @@ def parse_backend(spec):
                    float(opts.get("prefill", 2000)),
                    float(opts.get("decode", 40)),
                    int(opts.get("affinity_min_tokens", AFFINITY_MIN_TOKENS)),
-                   float(opts.get("attn", 0.0)))
+                   float(opts.get("attn", 0.0)),
+                   int(opts.get("affinity_slots", AFFINITY_SLOTS)))
 
 
 def main():
@@ -422,7 +429,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--backend", action="append", required=True,
                     help="name=url[,max_context=N][,prefill=tok/s][,decode=tok/s]"
-                         "[,attn=s_per_token_squared][,affinity_min_tokens=N]")
+                         "[,attn=s_per_token_squared][,affinity_min_tokens=N]"
+                         "[,affinity_slots=N]")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 

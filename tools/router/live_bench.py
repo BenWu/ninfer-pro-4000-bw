@@ -155,8 +155,10 @@ def main():
         backends = [
             ninfer_router.Backend("blackwell", urls[0], 81920, 3860, 57.4,
                                   attention_s_per_token2=2.493e-9),
+            # The 4090 fork holds one context, not three: its reuse is a
+            # retained-sequence check with no context cache behind it.
             ninfer_router.Backend("rtx4090", urls[1], 262144, 2115, 108.0,
-                                  attention_s_per_token2=1.619e-9),
+                                  attention_s_per_token2=1.619e-9, affinity_slots=1),
         ]
         handler = type("H", (ninfer_router.Handler,), {
             "router": ninfer_router.Router(backends, lambda line: None)})

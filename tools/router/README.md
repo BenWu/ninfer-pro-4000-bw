@@ -69,6 +69,29 @@ card restart. It is proxied unchanged instead.
 | `attn` | quadratic attention coefficient in seconds per token squared |
 | `decode` | decode rate in tokens per second |
 | `affinity_min_tokens` | below this a prefix is assumed not retained, default 2048 |
+| `affinity_slots` | contexts the card holds, default 3, **use 1 for the 4090** |
+
+### The two forks retain differently
+
+They are different engine lineages, and it changes how many conversations each
+card can keep warm. The Blackwell fork has a cost-model driven context cache
+(`src/runtime/engine/context_cost.cpp`, about 9600 lines in `runtime/engine`).
+The 4090 fork has none: reuse is a retained-sequence check
+(`request_plan_impl.h:182`, about 2500 lines), and it holds exactly one context.
+
+Alternating two 4000 word documents, time to first token:
+
+| | cold | repeat | alternating |
+|---|---|---|---|
+| Blackwell, calibrated presets | 7.9 s | 0.09 s | 6 of 6 hits |
+| RTX 4090 | 7.8 s | **0.028 s** | 0 of 6, every one pays 7.85 s |
+
+The 4090 is faster on a hit and useless on an alternation. Setting
+`affinity_slots=1` for it stops the router promising a hit that card cannot
+give. This is architectural rather than a misconfiguration:
+`--context-cost-presets` cannot be ported to that fork without backporting the
+whole context-cache subsystem, since it has no `ContextCacheOptions`,
+`max_shared_prefixes` or `max_private_continuations` at all.
 
 ## Measured coefficients
 
@@ -190,11 +213,27 @@ MTP3, the largest context that started:
 | 3 | 65536 | | | | |
 | 4 | 40960 | 55.8 | 46.9 | 144.8 tok/s | 2.59 s |
 
-Concurrency 2 is a genuinely good trade and worth taking on its own: two
-concurrent generations run at 57.1 tokens per second each against 56.0 alone, so
-aggregate decode doubles for no per-stream cost. Decode is bound on loading
-weights, so a second sequence rides along nearly free. Concurrency 4 reaches
-2.76x aggregate but gives up 16% per stream and most of the context.
+The ceiling drops, but at the 81920 that `serve.sh` defaults to, concurrency 2
+costs no context at all. What it spends is spare memory: available-after-startup
+falls from 580 MiB to 272 MiB, because the CUDA graph allowance doubles with
+concurrency. Whether that is enough depends on how large a vision payload has to
+fit. At the 106496 ceiling only 122 MiB is left, which is thin.
+
+The upside is real: two concurrent generations run at 57.1 tokens per second
+each against 56.0 alone, so aggregate decode doubles for no per-stream cost,
+because decode is bound on loading weights and a second sequence rides along.
+Concurrency 4 reaches 2.76x aggregate but gives up 16% per stream and most of
+the context.
+
+Pool size does not affect prefill speed, so choosing a context is about what fits
+and what slack is left rather than throughput:
+
+| prompt | ctx 106496 | ctx 81920 | ctx 81920, concurrency 2 |
+|---|---|---|---|
+| 2.4k | 0.76 s | 0.77 s | 0.76 s |
+| 32k | 10.79 s | 11.01 s | 11.12 s |
+| 63k | 25.75 s | 26.37 s | 26.63 s |
+| 100k | 50.44 s | rejected | rejected |
 
 What it does not do is fix head of line blocking, which is the reason the router
 exists. A short call arriving 0.3 seconds behind a cold 32k prefill:

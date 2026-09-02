@@ -30,10 +30,20 @@
 #   3                           65536                  81920           57344
 #   4                           40960                  49152           32768
 #
-# Concurrency 2 is the good trade. Two concurrent generations run at 57.1 tok/s each against 56.0
-# alone, so aggregate decode doubles to 104.7 tok/s for no per-stream cost, and the context it gives
-# up is the headroom step this script was already leaving unused. Concurrency 4 reaches 144.8 tok/s
-# aggregate but costs 16% per stream and most of the context.
+# The ceiling drops, but at the 81920 this script defaults to, concurrency 2 costs no context at
+# all. What it spends is spare memory: available-after-startup falls from 580 MiB to 272 MiB,
+# because the CUDA graph allowance doubles with concurrency (82 MiB to 164 MiB). Whether that is
+# enough slack depends on how large a vision payload has to fit, which is what the headroom in the
+# first table is for. At the 106496 ceiling only 122 MiB is left, which is thin.
+#
+# The upside is real: two concurrent generations run at 57.1 tok/s each against 56.0 alone, so
+# aggregate decode doubles to 104.7 tok/s for no per-stream cost, because decode is bound on
+# loading weights and a second sequence rides along. Concurrency 4 reaches 144.8 tok/s aggregate
+# but costs 16% per stream and most of the context.
+#
+# Pool size does not affect prefill speed. A 32k prompt took 10.79s at 106496, 11.01s at 81920 and
+# 11.12s at concurrency 2, and a 63k prompt 25.7s, 26.4s and 26.6s. Choosing a context is about
+# what fits and what slack is left, not throughput. A 100k prompt is rejected below 106496.
 #
 # What concurrency does not buy is protection from a long prefill. A short call arriving behind a
 # cold 32k prefill waited 10.7s at every concurrency level, because a lane's prefill runs to

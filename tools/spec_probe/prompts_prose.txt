@@ -1,0 +1,99 @@
+Describe in plain prose, without lists or headings, how a paged KV cache differs from a contiguous one.
+
+Explain in a single flowing paragraph why decode is usually memory bandwidth bound while prefill is compute bound.
+
+Write a short prose explanation of what speculative decoding is and why it speeds up generation.
+
+In plain prose, describe what happens to a request between arriving at an inference server and producing its first token.
+
+Explain conversationally why quantizing model weights to four bits usually costs less accuracy than people expect.
+
+Describe, in prose only, the difference between a tensor core and a regular CUDA core.
+
+Write a paragraph explaining why batching many requests together improves GPU utilization during decode.
+
+In plain prose, explain what a rotary position embedding does and why it replaced learned position embeddings.
+
+Describe without any lists how attention lets a model relate distant tokens to each other.
+
+Explain in a short paragraph why the first token of a response takes longer to produce than the ones after it.
+
+Write prose describing what happens when a GPU runs out of memory during inference and how servers avoid it.
+
+Explain in plain sentences why two runs of the same model can produce different output even at temperature zero.
+
+Describe conversationally what a tokenizer does and why word boundaries are not the same as token boundaries.
+
+In prose, explain why larger batch sizes hurt latency even though they help throughput.
+
+Write a paragraph about why model weights are stored separately from the key value cache.
+
+Explain in plain prose how a language model decides when to stop generating.
+
+Describe without lists why streaming a response feels faster to a user than waiting for the whole thing.
+
+In a short paragraph, explain what prefix caching does and when it fails to help.
+
+Write prose explaining why an inference engine needs to know the maximum context length in advance.
+
+Explain conversationally what happens inside a transformer layer, in order, for a single token.
+
+Describe in plain prose why floating point addition is not associative and why that matters on a GPU.
+
+Write a paragraph explaining the difference between latency and throughput for someone new to serving.
+
+In prose only, explain why a model with more parameters is not automatically slower to run.
+
+Describe how a scheduler decides which pending request to run next when the GPU frees up.
+
+Explain in plain sentences why copying data between CPU and GPU memory is often the slow part.
+
+Write a short prose passage about why inference servers preallocate memory instead of allocating on demand.
+
+In plain prose, describe what makes a kernel launch expensive and how CUDA graphs help.
+
+Explain conversationally why the same model gives different answers when the prompt is phrased differently.
+
+Describe without lists what a draft model is and what makes a good one.
+
+Write a paragraph explaining why long contexts make attention quadratically more expensive.
+
+In prose, explain what happens when two requests want the same GPU at the same moment.
+
+Describe in plain sentences why compilers cannot always optimize numerical code safely.
+
+Explain conversationally what a memory bandwidth bottleneck feels like from the outside.
+
+Write prose about why benchmarks run on an idle machine often mislead.
+
+In plain prose, describe the tradeoff between storing the key value cache in high and low precision.
+
+Explain in a paragraph why a model can be fast at generating text but slow at reading it.
+
+Describe without lists how an inference server decides to evict a cached session.
+
+Write a short prose explanation of what makes a matrix multiplication efficient on modern hardware.
+
+In prose, explain why adding a second GPU does not automatically double inference speed.
+
+Describe conversationally what a warm cache means for a language model server.
+
+Explain in plain sentences why sampling temperature changes the character of generated text.
+
+Write a paragraph about why measuring tokens per second can be misleading.
+
+In plain prose, describe what happens if a model is given a prompt longer than its context window.
+
+Explain conversationally why some layers of a neural network are more sensitive to quantization than others.
+
+Describe without lists why an inference engine separates the prompt processing phase from generation.
+
+Write prose explaining what a page of a key value cache holds and why pages are useful.
+
+In plain prose, explain why reproducibility is harder on a GPU than on a CPU.
+
+Describe in a paragraph how a server can serve many users from one copy of the model weights.
+
+Explain conversationally what happens to generation quality when a draft model disagrees often.
+
+Write a short prose passage about why the last layer of a language model is unusually large.

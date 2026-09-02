@@ -20,7 +20,7 @@ SLOTS = 3
 
 
 class State:
-    def __init__(self, prefill_tok_s, decode_tok_s, max_context, speed):
+    def __init__(self, prefill_tok_s, decode_tok_s, max_context, speed, model_id="mock-model"):
         self.prefill_tok_s = prefill_tok_s
         self.decode_tok_s = decode_tok_s
         self.max_context = max_context
@@ -29,6 +29,7 @@ class State:
         self.cache = collections.OrderedDict()
         self.served = 0
         self.hits = 0
+        self.model_id = model_id
 
 
 def prompt_tokens(body):
@@ -66,9 +67,20 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def handle_one_request(self):
+        # Disconnect tests hang up mid-response on purpose; the default handler
+        # prints a traceback for that, which is noise rather than a result.
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+
     def do_GET(self):
         if self.path == "/health":
             blob = json.dumps({"status": "ok"}).encode()
+        elif self.path == "/v1/models":
+            blob = json.dumps({"object": "list",
+                               "data": [{"id": self.state.model_id, "object": "model"}]}).encode()
         else:
             blob = json.dumps({"served": self.state.served, "hits": self.state.hits}).encode()
         self.send_response(200)
@@ -81,6 +93,15 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
         state = self.state
+        # A request the caller wants to fail, for exercising rollback paths.
+        if "FAIL-ME" in json.dumps(body.get("messages") or []):
+            blob = json.dumps({"error": {"message": "synthetic failure"}}).encode()
+            self.send_response(500)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+            return
         total = prompt_tokens(body)
         out = body.get("max_tokens") or 64
         keys = prefix_keys(body)
@@ -126,8 +147,9 @@ class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 
-def serve(port, prefill, decode, max_context, speed):
-    handler = type("H", (Handler,), {"state": State(prefill, decode, max_context, speed)})
+def serve(port, prefill, decode, max_context, speed, model_id="mock-model"):
+    handler = type("H", (Handler,),
+                   {"state": State(prefill, decode, max_context, speed, model_id)})
     server = ThreadedServer(("127.0.0.1", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, handler.state

@@ -112,6 +112,18 @@ class Backend:
         while len(self.prefixes) > self.affinity_slots:
             self.prefixes.popitem(last=False)
 
+    def forget(self, hashes):
+        """Undo a remember() for a request that did not complete.
+
+        Affinity is recorded at dispatch so a second request for the same
+        conversation follows the first rather than racing it. If the request
+        then fails, the card never built that prefix, and leaving the entry
+        would send every follow up to a card holding nothing.
+        """
+        if not hashes:
+            return
+        self.prefixes.pop(hashes[-1][0], None)
+
     def warm_tokens(self, hashes):
         """Tokens of the longest prefix of this request the backend still holds."""
         best = 0
@@ -301,17 +313,19 @@ class Router:
             chosen.pending_seconds += committed
             chosen.stats[reason.split("(")[0]] += 1
             chosen.remember(hashes)
-        return chosen, reason, prompt_tokens, committed
+        return chosen, reason, prompt_tokens, committed, hashes
 
     def _completion_estimate(self, backend, prompt_tokens, warm_tokens, output_tokens):
         """Work already committed to this backend, plus this request's own."""
         return backend.pending_seconds + backend.estimate_seconds(
             prompt_tokens, warm_tokens, output_tokens)
 
-    def release(self, backend, committed):
+    def release(self, backend, committed, hashes=None, succeeded=True):
         with self.lock:
             backend.queued -= 1
             backend.pending_seconds = max(0.0, backend.pending_seconds - committed)
+            if not succeeded:
+                backend.forget(hashes)
 
     def snapshot(self):
         with self.lock:
@@ -395,17 +409,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(blob)))
             self.end_headers()
             self.wfile.write(blob)
-            return
+            return True
         self.send_response(upstream.status)
         self.send_header("content-type", content_type)
         self.send_header("cache-control", "no-cache")
         self.send_header("transfer-encoding", "chunked")
         self.end_headers()
-        for chunk in upstream:
-            self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+        try:
+            for chunk in upstream:
+                self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # The client gave up. Returning here closes the upstream response,
+            # which the server sees as its own client disconnecting and
+            # cancels on, so the card is freed instead of generating into a
+            # socket nobody is reading.
+            self.close_connection = True
+            return False
+        return True
 
     def _forward_headers(self):
         keep = {}
@@ -424,19 +447,22 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self._send_json(400, {"error": {"message": "body must be an object"}})
 
-        backend, reason, prompt_tokens, committed = self.router.choose(adapter(body))
+        backend, reason, prompt_tokens, committed, hashes = self.router.choose(adapter(body))
         started = time.perf_counter()
+        waited = 0.0
+        succeeded = False
         try:
             # One in flight per backend. Holding the queue here rather than in
             # the server is what keeps a short request from waiting behind a
             # long prefill it never needed to follow.
             with backend.lock:
                 waited = time.perf_counter() - started
-                self._stream_from(backend, path, raw)
+                succeeded = self._stream_from(backend, path, raw)
         finally:
-            self.router.release(backend, committed)
+            self.router.release(backend, committed, hashes, succeeded)
         self.router.log(f"{backend.name:10s} {path:22s} {reason:32s} "
-                        f"~{prompt_tokens:>7} tok wait={waited * 1000:7.1f}ms")
+                        f"~{prompt_tokens:>7} tok wait={waited * 1000:7.1f}ms"
+                        f"{'' if succeeded else '  [incomplete]'}")
 
     def _stream_from(self, backend, path, raw):
         req = urllib.request.Request(backend.url + path, data=raw,
@@ -444,12 +470,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             upstream = urllib.request.urlopen(req, timeout=1800)
         except urllib.error.HTTPError as exc:
-            return self._relay_error(exc)
+            self._relay_error(exc)
+            return False
         except Exception as exc:
-            return self._send_json(502, {"error": {"message": f"upstream {backend.name}: {exc}"}})
+            self._send_json(502, {"error": {"message": f"upstream {backend.name}: {exc}"}})
+            return False
 
         with upstream:
-            self._relay(upstream)
+            return self._relay(upstream)
 
 
 class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -471,6 +499,39 @@ def parse_backend(spec):
                    int(opts.get("affinity_slots", AFFINITY_SLOTS)))
 
 
+def backend_model_id(backend, timeout=5):
+    """The model a backend reports, or None if it is not answering yet."""
+    try:
+        with urllib.request.urlopen(backend.url + "/v1/models", timeout=timeout) as response:
+            payload = json.load(response)
+    except Exception:
+        return None
+    entries = payload.get("data") or []
+    return entries[0].get("id") if entries else None
+
+
+def check_backends(backends, log):
+    """Refuse to route across servers holding different models.
+
+    Splitting one conversation between two models is not a slow answer, it is a
+    wrong one, and nothing downstream would notice. A backend that is merely not
+    up yet is only reported, since it may still be loading.
+    """
+    seen = {}
+    for backend in backends:
+        model = backend_model_id(backend)
+        if model is None:
+            log(f"warning: {backend.name} at {backend.url} is not answering /v1/models yet")
+            continue
+        seen[backend.name] = model
+        log(f"{backend.name:10s} {backend.url}  model={model}")
+    distinct = set(seen.values())
+    if len(distinct) > 1:
+        raise SystemExit(
+            "backends serve different models, refusing to route: "
+            + ", ".join(f"{n}={m}" for n, m in sorted(seen.items())))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8090)
@@ -488,6 +549,7 @@ def main():
         if not args.quiet:
             print(line, file=sys.stderr, flush=True)
 
+    check_backends(backends, log)
     Handler.router = Router(backends, log)
     server = ThreadedServer((args.host, args.port), Handler)
     log(f"router on http://{args.host}:{args.port} -> " +

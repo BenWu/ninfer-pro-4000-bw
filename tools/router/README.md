@@ -167,6 +167,17 @@ so a green run is evidence about placement decisions, not inference speed.
 | 3 long documents, 9 bunched turns | 0.466 | 0.330 | **0.255** |
 | 3 long documents among 11 chat turns | 0.394 | 0.226 | **0.200** |
 
+`test_router_behaviour.py` covers the failure paths the latency suite never
+reaches: that a failed request leaves no affinity behind and leaks no queue
+depth, that a client hanging up mid-stream frees the card rather than leaving it
+generating into a dead socket, and that two servers holding different models are
+refused rather than silently splitting a conversation between them.
+
+    python3 tools/router/test_router_behaviour.py
+
+Against the live server, hanging up on a 2000 token generation freed the card in
+0.31 seconds rather than the roughly 35 seconds it would have run for.
+
 `live_bench.py` runs the same comparison against both real servers, which is the
 claim that matters. Every policy gets its own nonce so all four face equally
 cold caches; without that the policies run in order and each is warmed by the

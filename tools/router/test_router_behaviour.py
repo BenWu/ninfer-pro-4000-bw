@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Checks for the failure paths the latency suite never reaches.
+
+test_router.py answers whether placement is any good. These answer whether the
+router stays honest when a request fails, a client hangs up, or the two servers
+are not holding the same model.
+"""
+import json
+import socket
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+import mock_backend                                   # noqa: E402
+import ninfer_router                                  # noqa: E402
+
+FAILURES = []
+
+
+def check(name, ok, detail=""):
+    print(f"  {'pass' if ok else 'FAIL'}  {name}{'' if ok else '  ' + detail}")
+    if not ok:
+        FAILURES.append(name)
+
+
+def start_router(port, backends):
+    handler = type("H", (ninfer_router.Handler,), {
+        "router": ninfer_router.Router(backends, lambda line: None)})
+    server = ninfer_router.ThreadedServer(("127.0.0.1", port), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    time.sleep(0.2)
+    return server, handler.router
+
+
+def long_body(tag, words=20000, max_tokens=32):
+    return {"model": "m", "max_tokens": max_tokens, "stream": True,
+            "messages": [{"role": "user", "content": f"{tag} " + "word " * words}]}
+
+
+def test_failed_request_forgets_affinity():
+    port = 9501
+    mock_backend.serve(port, 3000, 60, 200000, 400.0)
+    backend = ninfer_router.Backend("one", f"http://127.0.0.1:{port}", 200000, 3000, 60)
+    server, router = start_router(9502, [backend])
+
+    body = long_body("FAIL-ME")
+    try:
+        urllib.request.urlopen(urllib.request.Request(
+            "http://127.0.0.1:9502/v1/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json"}), timeout=30).read()
+    except urllib.error.HTTPError:
+        pass
+    check("a failed request leaves no affinity behind", len(backend.prefixes) == 0,
+          f"{len(backend.prefixes)} prefixes retained")
+
+    ok_body = long_body("KEEP-ME")
+    urllib.request.urlopen(urllib.request.Request(
+        "http://127.0.0.1:9502/v1/chat/completions",
+        data=json.dumps(ok_body).encode(),
+        headers={"content-type": "application/json"}), timeout=60).read()
+    check("a successful request does record affinity", len(backend.prefixes) == 1,
+          f"{len(backend.prefixes)} prefixes retained")
+    check("a failed request does not leak queue depth", backend.queued == 0,
+          f"queued={backend.queued}")
+    check("a failed request does not leak committed work", backend.pending_seconds < 0.01,
+          f"pending={backend.pending_seconds:.3f}s")
+    server.shutdown()
+    server.server_close()
+
+
+def test_client_disconnect_frees_the_backend():
+    port = 9503
+    mock_backend.serve(port, 3000, 60, 200000, 60.0)
+    backend = ninfer_router.Backend("one", f"http://127.0.0.1:{port}", 200000, 3000, 60)
+    server, router = start_router(9504, [backend])
+
+    # Send a slow request, read one byte, then hang up hard.
+    body = json.dumps(long_body("DISCONNECT", words=8000, max_tokens=512)).encode()
+    raw = socket.create_connection(("127.0.0.1", 9504), timeout=30)
+    raw.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                b"content-type: application/json\r\n"
+                b"content-length: %d\r\n\r\n" % len(body) + body)
+    time.sleep(0.5)
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                   __import__("struct").pack("ii", 1, 0))   # RST rather than FIN
+    raw.close()
+
+    # The backend must become reusable rather than staying locked forever.
+    freed = False
+    for _ in range(120):
+        if backend.lock.acquire(blocking=False):
+            backend.lock.release()
+            freed = True
+            break
+        time.sleep(0.25)
+    check("the backend is released after the client hangs up", freed,
+          "lock still held 30s later")
+    check("queue depth returns to zero after a disconnect", backend.queued == 0,
+          f"queued={backend.queued}")
+    server.shutdown()
+    server.server_close()
+
+
+def test_mismatched_models_are_refused():
+    mock_backend.serve(9505, 3000, 60, 200000, 400.0, model_id="model-a")
+    mock_backend.serve(9506, 3000, 60, 200000, 400.0, model_id="model-b")
+    same = [ninfer_router.Backend("a", "http://127.0.0.1:9505", 200000, 3000, 60),
+            ninfer_router.Backend("b", "http://127.0.0.1:9505", 200000, 3000, 60)]
+    different = [ninfer_router.Backend("a", "http://127.0.0.1:9505", 200000, 3000, 60),
+                 ninfer_router.Backend("b", "http://127.0.0.1:9506", 200000, 3000, 60)]
+
+    try:
+        ninfer_router.check_backends(same, lambda line: None)
+        matching_ok = True
+    except SystemExit:
+        matching_ok = False
+    check("matching models are accepted", matching_ok)
+
+    try:
+        ninfer_router.check_backends(different, lambda line: None)
+        refused = False
+    except SystemExit:
+        refused = True
+    check("mismatched models are refused", refused, "routed across two different models")
+
+    absent = [ninfer_router.Backend("a", "http://127.0.0.1:9505", 200000, 3000, 60),
+              ninfer_router.Backend("down", "http://127.0.0.1:9599", 200000, 3000, 60)]
+    try:
+        ninfer_router.check_backends(absent, lambda line: None)
+        tolerated = True
+    except SystemExit:
+        tolerated = False
+    check("a backend that is not up yet is a warning, not a refusal", tolerated)
+
+
+def main():
+    print("failure and identity behaviour")
+    test_failed_request_forgets_affinity()
+    test_client_disconnect_frees_the_backend()
+    test_mismatched_models_are_refused()
+    if FAILURES:
+        print(f"\nFAIL: {len(FAILURES)} check(s) failed")
+        return 1
+    print("\nPASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

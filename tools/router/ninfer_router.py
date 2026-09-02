@@ -37,6 +37,18 @@ from http.server import BaseHTTPRequestHandler
 # token, so dividing by 3 overestimates and errs toward the larger context.
 CHARS_PER_TOKEN = 3.0
 
+# An image is a few hundred to a couple of thousand tokens, but its base64 text
+# is megabytes, so counting its characters would estimate a small screenshot at
+# hundreds of thousands of tokens and conclude it fits nowhere. Both servers run
+# --vision, so this case is live. Flat per-image estimate instead; use
+# /v1/messages/count_tokens if an exact figure is ever needed.
+TOKENS_PER_IMAGE = 1024
+
+# What a server generates when the client names no limit. Matches the
+# --default-max-tokens both launch scripts pass; guessing low here would
+# underprice decode and bias placement toward the slower-decoding card.
+DEFAULT_MAX_TOKENS = 8192
+
 # How many contexts a card holds. The two forks differ, so this is per backend.
 # The Blackwell fork has a context cache and derives two private continuations
 # plus one shared prefix at --max-concurrency 1. The 4090 fork has no such
@@ -122,10 +134,24 @@ class Backend:
         return prefill + output_tokens / self.decode_tok_s
 
 
+def preamble_of(body):
+    """Request fields that render ahead of the conversation.
+
+    Tools become a "# Tools" block at the very front of the system preamble
+    (`chat_template.cpp:321`), so two requests with identical messages but
+    different tools share no prefix at all. Leaving them out of the hash would
+    claim an affinity that misses from the first token.
+    """
+    keys = ("tools", "tool_choice", "response_format")
+    present = {k: body[k] for k in keys if body.get(k) is not None}
+    return present or None
+
+
 def adapt_anthropic(body):
     """Anthropic keeps the system turn in a top level field."""
     return {"system": body.get("system"),
             "messages": body.get("messages") or [],
+            "preamble": preamble_of(body),
             "max_tokens": body.get("max_tokens")}
 
 
@@ -139,6 +165,7 @@ def adapt_openai_chat(body):
     """
     return {"system": None,
             "messages": body.get("messages") or [],
+            "preamble": preamble_of(body),
             "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens")}
 
 
@@ -153,30 +180,50 @@ GENERATING_ENDPOINTS = {
 }
 
 
-def prefix_hashes(system, messages):
+def message_tokens(message):
+    """Rough token size of one message, counting images flat rather than by text."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return int(len(json.dumps(message)) / CHARS_PER_TOKEN)
+    total = int(len(json.dumps(message.get("role", ""))) / CHARS_PER_TOKEN)
+    for part in content:
+        if not isinstance(part, dict):
+            total += int(len(json.dumps(part)) / CHARS_PER_TOKEN)
+        elif part.get("type") in ("image_url", "image", "input_image"):
+            total += TOKENS_PER_IMAGE
+        else:
+            total += int(len(json.dumps(part)) / CHARS_PER_TOKEN)
+    return total
+
+
+def prefix_hashes(preamble, system, messages):
     """Cumulative hashes of every conversation prefix, shortest first.
 
     The server caches exact prefixes, so turn N+1 of a conversation shares turn
     N's bytes. Hashing each cumulative prefix lets the router match a follow-up
-    to the card that served the turn before it.
+    to the card that served the turn before it. The preamble seeds the digest
+    because it renders ahead of everything else.
     """
     digest = hashlib.blake2b(digest_size=16)
+    if preamble is not None:
+        digest.update(json.dumps(preamble, sort_keys=True).encode())
     if system is not None:
         digest.update(json.dumps(system, sort_keys=True).encode())
     out = []
-    chars = len(json.dumps(system)) if system is not None else 0
+    tokens = int(len(json.dumps(system)) / CHARS_PER_TOKEN) if system is not None else 0
     for message in messages:
         digest.update(json.dumps(message, sort_keys=True).encode())
-        chars += len(json.dumps(message))
-        out.append((digest.hexdigest(), int(chars / CHARS_PER_TOKEN)))
+        tokens += message_tokens(message)
+        out.append((digest.hexdigest(), tokens))
     return out
 
 
 def estimate_prompt_tokens(request):
     system = request["system"]
-    chars = len(json.dumps(system)) if system is not None else 0
-    chars += sum(len(json.dumps(m)) for m in request["messages"])
-    return int(chars / CHARS_PER_TOKEN)
+    total = int(len(json.dumps(system)) / CHARS_PER_TOKEN) if system is not None else 0
+    if request["preamble"] is not None:
+        total += int(len(json.dumps(request["preamble"])) / CHARS_PER_TOKEN)
+    return total + sum(message_tokens(m) for m in request["messages"])
 
 
 class Router:
@@ -187,8 +234,8 @@ class Router:
 
     def choose(self, request):
         prompt_tokens = estimate_prompt_tokens(request)
-        output_tokens = request["max_tokens"] or 512
-        hashes = prefix_hashes(request["system"], request["messages"])
+        output_tokens = request["max_tokens"] or DEFAULT_MAX_TOKENS
+        hashes = prefix_hashes(request["preamble"], request["system"], request["messages"])
 
         with self.lock:
             fits = [b for b in self.backends

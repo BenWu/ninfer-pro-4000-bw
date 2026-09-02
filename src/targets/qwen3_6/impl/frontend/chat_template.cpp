@@ -593,6 +593,13 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                                 .kind = RewriteCheckpointKind::ResponseReplay, .offset = generation_begin};
             rendered.append_template("<|im_start|>assistant\n");
             add_rewrite_execution_boundary();
+            // Continuation only runs with thinking disabled, so the prefill resumes a response
+            // that was opened with an empty thinking block. Omitting it makes the model read the
+            // turn as finished and emit end of turn instead of continuing.
+            rendered.append_template("<think>\n");
+            add_rewrite_execution_boundary();
+            rendered.append_template("\n</think>\n\n");
+            add_rewrite_execution_boundary();
             rendered.append(content);
             message_boundaries[i + 1U] = rendered.size();
             continue;

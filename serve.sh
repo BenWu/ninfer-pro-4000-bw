@@ -74,8 +74,11 @@ ARGS=("$MODEL"
 [ "$VISION" = 1 ] && ARGS+=(--vision)
 [ "$MTP" = 1 ] && ARGS+=(--spec mtp --draft-tokens "$DRAFT_TOKENS" --lm-head-draft)
 
-# Measured prefill cost model for this card. Only the prefill component was accepted by the
-# calibrator; transfer falls back to the generic defaults. Skipped silently if absent.
+# Measured cost model for this card, driving context-cache retention. Both the transfer and
+# prefill components are calibrated and accepted; startup logs transfer_source and prefill_source
+# as "external" when they load. The file is keyed by model_id and weights_id, so re-run the
+# calibrator after switching artifacts or the entry misses and generic defaults are used silently.
+# Skipped if absent.
 [ -f "$PRESETS" ] && ARGS+=(--context-cost-presets "$PRESETS")
 
 echo "+ $BIN ${ARGS[*]} $*" >&2

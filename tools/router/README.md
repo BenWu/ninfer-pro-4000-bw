@@ -203,27 +203,23 @@ The obvious cheaper alternative to a second card is to let one server take more
 than one request at a time. It was measured, and it does not substitute.
 
 Both servers run `--max-concurrency 1`. Raising it costs context, because the
-context-cache capacities scale off it. Measured on the Blackwell with vision and
-MTP3, the largest context that started:
+context-cache capacities scale off it: the CUDA graph allowance alone doubles
+from 82 to 164 MiB. Measured on the Blackwell with vision and MTP3, on an 8192
+step grid:
 
-| concurrency | max context | 1 stream | loaded per-stream | aggregate decode | 8 short calls |
-|---|---|---|---|---|---|
-| 1 | 106496 | 56.0 tok/s | 56.0 | 52.5 tok/s | 2.83 s |
-| 2 | 86016 | 56.0 | **57.1** | **104.7** tok/s | 2.11 s |
-| 3 | 65536 | | | | |
-| 4 | 40960 | 55.8 | 46.9 | 144.8 tok/s | 2.59 s |
+| concurrency | ceiling | `serve.sh` default | 1 stream | loaded per-stream | aggregate decode | 8 short calls |
+|---|---|---|---|---|---|---|
+| 1 | 106496 | 98304 | 56.0 tok/s | 56.0 | 52.5 tok/s | 2.83 s |
+| 2 | 81920 | 73728 | 56.0 | **57.1** | **104.7** tok/s | 2.11 s |
+| 3 | 65536 | 57344 | | | | |
+| 4 | 40960 | 32768 | 55.8 | 46.9 | 144.8 tok/s | 2.59 s |
 
-The ceiling drops, but at the 81920 that `serve.sh` defaults to, concurrency 2
-costs no context at all. What it spends is spare memory: available-after-startup
-falls from 580 MiB to 272 MiB, because the CUDA graph allowance doubles with
-concurrency. Whether that is enough depends on how large a vision payload has to
-fit. At the 106496 ceiling only 122 MiB is left, which is thin.
-
-The upside is real: two concurrent generations run at 57.1 tokens per second
-each against 56.0 alone, so aggregate decode doubles for no per-stream cost,
-because decode is bound on loading weights and a second sequence rides along.
-Concurrency 4 reaches 2.76x aggregate but gives up 16% per stream and most of
-the context.
+Concurrency 2 costs 24576 tokens of context, a quarter of it, which is real on a
+card where NVFP4 weights already hold the context down. What it buys is
+aggregate decode: two concurrent generations run at 57.1 tokens per second each
+against 56.0 alone, so throughput doubles for no per-stream cost, because decode
+is bound on loading weights and a second sequence rides along. Concurrency 4
+reaches 2.76x aggregate but gives up 16% per stream and most of the context.
 
 Pool size does not affect prefill speed, so choosing a context is about what fits
 and what slack is left rather than throughput:

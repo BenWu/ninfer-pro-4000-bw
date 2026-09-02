@@ -2,48 +2,41 @@
 # Start ninfer-serve on the RTX PRO 4000 with NVFP4 weights and NVFP4 KV.
 #
 # With CTX unset the context is chosen from the feature combination, using values measured on this
-# machine (ECC on, 24467 MiB usable, NVFP4 weights, NVFP4 KV, --max-concurrency 1). Each pair below
-# is the largest context that started, and the default this script picks, which is one step below
-# it so there is room to spare:
+# machine (ECC on, 24467 MiB usable, NVFP4 weights, NVFP4 KV). Each ceiling below is the largest
+# 8192 step that started; the default is one step under it so there is room to spare:
 #
-#   features            ceiling            default picked      slack at the default
-#   plain               200704 ( 37 MiB)   196608              109 MiB
-#   --vision            147456 ( 17 MiB)   139264              161 MiB
-#   MTP3                139264 (113 MiB)   131072              266 MiB
-#   --vision + MTP3      90112 ( 75 MiB)    81920              228 MiB
+#   features            ceiling             default picked      slack at the default
+#   plain               212992 (104 MiB)    204800              248 MiB
+#   --vision            163840 ( 12 MiB)    155648              156 MiB
+#   MTP3                155648 (160 MiB)    147456              312 MiB
+#   --vision + MTP3     106496 (122 MiB)     98304              274 MiB
 #
 # Running at a ceiling works but leaves nothing for a larger media payload or a different driver
 # state, so the defaults trade a step of context for headroom. Override with CTX=... to run at the
 # ceiling, or anywhere else.
 #
-# Both features cost memory before KV is allocated: vision 282 MiB, MTP3 771 MiB. MTP3 is the
-# expensive one because of its recurrent draft state, which is why enabling it costs more context
-# than vision does.
+# These ceilings were re-measured on 2026-09-02 and every one came out 8192 to 16384 tokens above
+# the values previously recorded here, so the old defaults were leaving context unused. Re-measure
+# after a driver change rather than trusting the table.
 #
-# The table above is for --max-concurrency 1. Raising MAX_CONCURRENCY lowers every entry, because
-# the context-cache defaults scale off it (device-state slots = concurrency, private continuations
-# = 2x, shared prefixes = 1x). Measured for vision + MTP3, the combination this script defaults to:
+# Both features cost memory before KV is allocated. MTP3 is the expensive one because of its
+# recurrent draft state, which is why enabling it costs more context than vision does.
 #
-#   concurrency   largest that started   next step up failed   default picked
-#   1                          106496                 114688           81920
-#   2                           86016                  90112           81920
-#   3                           65536                  81920           57344
-#   4                           40960                  49152           32768
+# Raising MAX_CONCURRENCY lowers every entry, because the context-cache defaults scale off it
+# (device-state slots = concurrency, private continuations = 2x, shared prefixes = 1x). Measured
+# for vision + MTP3, the combination this script defaults to:
 #
-# The ceiling drops, but at the 81920 this script defaults to, concurrency 2 costs no context at
-# all. What it spends is spare memory: available-after-startup falls from 580 MiB to 272 MiB,
-# because the CUDA graph allowance doubles with concurrency (82 MiB to 164 MiB). Whether that is
-# enough slack depends on how large a vision payload has to fit, which is what the headroom in the
-# first table is for. At the 106496 ceiling only 122 MiB is left, which is thin.
+#   concurrency   ceiling             default picked      slack at the default
+#   1             106496 (122 MiB)     98304              274 MiB
+#   2              81920 (272 MiB)     73728              426 MiB
+#   3              65536 (272 MiB)     57344              426 MiB
+#   4              40960 (426 MiB)     32768              578 MiB
 #
-# The upside is real: two concurrent generations run at 57.1 tok/s each against 56.0 alone, so
-# aggregate decode doubles to 104.7 tok/s for no per-stream cost, because decode is bound on
-# loading weights and a second sequence rides along. Concurrency 4 reaches 144.8 tok/s aggregate
-# but costs 16% per stream and most of the context.
-#
-# Pool size does not affect prefill speed. A 32k prompt took 10.79s at 106496, 11.01s at 81920 and
-# 11.12s at concurrency 2, and a 63k prompt 25.7s, 26.4s and 26.6s. Choosing a context is about
-# what fits and what slack is left, not throughput. A 100k prompt is rejected below 106496.
+# Concurrency 2 costs 24576 tokens of context against concurrency 1, because the CUDA graph
+# allowance doubles (82 MiB to 164 MiB). What it buys is aggregate decode: two concurrent
+# generations run at 57.1 tok/s each against 56.0 alone, so throughput doubles to 104.7 tok/s for
+# no per-stream cost, since decode is bound on loading weights and a second sequence rides along.
+# Concurrency 4 reaches 144.8 tok/s aggregate but costs 16% per stream and most of the context.
 #
 # What concurrency does not buy is protection from a long prefill. A short call arriving behind a
 # cold 32k prefill waited 10.7s at every concurrency level, because a lane's prefill runs to
@@ -51,11 +44,17 @@
 # only slows the prefill down: 10.7s at 1024, 12.8s at 256, 15.3s at 128. Mixing long and short
 # requests on one card needs a second card and a router, not a bigger concurrency number.
 #
-# For any other KV dtype or feature combination the script still asks for CTX explicitly.
+# Pool size does not affect prefill speed. A 32k prompt took 10.79s at a 106496 context, 11.01s at
+# 81920 and 11.12s at concurrency 2, and a 63k prompt 25.7s, 26.4s and 26.6s. Choosing a context is
+# about what fits and what slack is left, not throughput.
+#
+# For any other KV dtype, or above concurrency 1 with a different feature combination, the script
+# asks for CTX explicitly.
 #
 # Usage:  ./serve.sh                     vision + MTP3, context chosen automatically
-#         VISION=0 ./serve.sh            drop vision, context rises to 131072
-#         CTX=90112 ./serve.sh           run at the measured ceiling instead
+#         VISION=0 ./serve.sh            drop vision, context rises to 147456
+#         CTX=106496 ./serve.sh          run at the measured ceiling instead
+#         MAX_CONCURRENCY=2 ./serve.sh   double aggregate decode, context falls to 73728
 #         ./serve.sh --greedy            extra flags are passed through to ninfer-serve
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -86,15 +85,15 @@ if [ -z "$CTX" ]; then
         exit 1
     fi
     if [ "$MAX_CONCURRENCY" = 1 ]; then
-        if [ "$VISION" = 1 ] && [ "$MTP" = 1 ]; then CTX=81920
-        elif [ "$VISION" = 1 ];                then CTX=139264
-        elif [ "$MTP" = 1 ];                   then CTX=131072
-        else                                        CTX=196608
+        if [ "$VISION" = 1 ] && [ "$MTP" = 1 ]; then CTX=98304
+        elif [ "$VISION" = 1 ];                then CTX=155648
+        elif [ "$MTP" = 1 ];                   then CTX=147456
+        else                                        CTX=204800
         fi
     elif [ "$VISION" = 1 ] && [ "$MTP" = 1 ]; then
         # Only this feature combination was measured above concurrency 1.
         case "$MAX_CONCURRENCY" in
-            2) CTX=81920 ;;
+            2) CTX=73728 ;;
             3) CTX=57344 ;;
             4) CTX=32768 ;;
             *) echo "serve.sh: no measured context for MAX_CONCURRENCY=$MAX_CONCURRENCY, set CTX explicitly." >&2

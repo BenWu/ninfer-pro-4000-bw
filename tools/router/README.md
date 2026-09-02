@@ -174,6 +174,47 @@ Running the first trace on `/v1/messages` instead gives 1.85 seconds against
 1.82, with identical placements, which is the endpoint parity claim above
 measured end to end.
 
+## Why not just raise --max-concurrency
+
+The obvious cheaper alternative to a second card is to let one server take more
+than one request at a time. It was measured, and it does not substitute.
+
+Both servers run `--max-concurrency 1`. Raising it costs context, because the
+context-cache capacities scale off it. Measured on the Blackwell with vision and
+MTP3, the largest context that started:
+
+| concurrency | max context | 1 stream | loaded per-stream | aggregate decode | 8 short calls |
+|---|---|---|---|---|---|
+| 1 | 106496 | 56.0 tok/s | 56.0 | 52.5 tok/s | 2.83 s |
+| 2 | 86016 | 56.0 | **57.1** | **104.7** tok/s | 2.11 s |
+| 3 | 65536 | | | | |
+| 4 | 40960 | 55.8 | 46.9 | 144.8 tok/s | 2.59 s |
+
+Concurrency 2 is a genuinely good trade and worth taking on its own: two
+concurrent generations run at 57.1 tokens per second each against 56.0 alone, so
+aggregate decode doubles for no per-stream cost. Decode is bound on loading
+weights, so a second sequence rides along nearly free. Concurrency 4 reaches
+2.76x aggregate but gives up 16% per stream and most of the context.
+
+What it does not do is fix head of line blocking, which is the reason the router
+exists. A short call arriving 0.3 seconds behind a cold 32k prefill:
+
+| concurrency | idle | behind a 32k prefill | penalty |
+|---|---|---|---|
+| 1 | 173 ms | 10750 ms | 62x |
+| 2 | 161 ms | 10696 ms | 67x |
+| 4 | 160 ms | 10708 ms | 67x |
+
+Unchanged at every level. A lane's prefill runs to completion before other lanes
+are served, so extra lanes let a request be admitted but not scheduled. Lowering
+`--prefill-chunk` does not interleave it either, it only makes the prefill
+slower: 10.7 s at 1024, 12.8 s at 256, 15.3 s at 128. There is no scheduler or
+admission flag that changes this.
+
+So the two are complementary rather than alternatives. Concurrency 2 on each
+card buys aggregate throughput; the router buys protection from long prefills.
+`serve.sh` picks a measured context for concurrency 1 to 4.
+
 ## Limitations
 
 Prompt length is estimated from serialized character count at 3.0 characters per

@@ -20,9 +20,28 @@
 # expensive one because of its recurrent draft state, which is why enabling it costs more context
 # than vision does.
 #
-# The table is only valid for NVFP4 KV at --max-concurrency 1. Raising MAX_CONCURRENCY lowers every
-# entry, because the context-cache defaults scale off it (device-state slots = concurrency, private
-# continuations = 2x, shared prefixes = 1x). Change either and the script warns and asks for CTX.
+# The table above is for --max-concurrency 1. Raising MAX_CONCURRENCY lowers every entry, because
+# the context-cache defaults scale off it (device-state slots = concurrency, private continuations
+# = 2x, shared prefixes = 1x). Measured for vision + MTP3, the combination this script defaults to:
+#
+#   concurrency   largest that started   next step up failed   default picked
+#   1                          106496                 114688           81920
+#   2                           86016                  90112           81920
+#   3                           65536                  81920           57344
+#   4                           40960                  49152           32768
+#
+# Concurrency 2 is the good trade. Two concurrent generations run at 57.1 tok/s each against 56.0
+# alone, so aggregate decode doubles to 104.7 tok/s for no per-stream cost, and the context it gives
+# up is the headroom step this script was already leaving unused. Concurrency 4 reaches 144.8 tok/s
+# aggregate but costs 16% per stream and most of the context.
+#
+# What concurrency does not buy is protection from a long prefill. A short call arriving behind a
+# cold 32k prefill waited 10.7s at every concurrency level, because a lane's prefill runs to
+# completion before other lanes are served. Lowering --prefill-chunk does not interleave it either,
+# only slows the prefill down: 10.7s at 1024, 12.8s at 256, 15.3s at 128. Mixing long and short
+# requests on one card needs a second card and a router, not a bigger concurrency number.
+#
+# For any other KV dtype or feature combination the script still asks for CTX explicitly.
 #
 # Usage:  ./serve.sh                     vision + MTP3, context chosen automatically
 #         VISION=0 ./serve.sh            drop vision, context rises to 131072
@@ -51,17 +70,32 @@ PRESETS=${PRESETS:-models/context_cost_presets.json}
 
 # Context defaults measured per feature combination. See the table at the top of this file.
 if [ -z "$CTX" ]; then
-    if [ "$KV_DTYPE" != nvfp4 ] || [ "$MAX_CONCURRENCY" != 1 ]; then
-        echo "serve.sh: the measured context table covers KV_DTYPE=nvfp4 at MAX_CONCURRENCY=1." >&2
-        echo "          You have KV_DTYPE=$KV_DTYPE MAX_CONCURRENCY=$MAX_CONCURRENCY, so set CTX explicitly." >&2
+    if [ "$KV_DTYPE" != nvfp4 ]; then
+        echo "serve.sh: the measured context table covers KV_DTYPE=nvfp4 only." >&2
+        echo "          You have KV_DTYPE=$KV_DTYPE, so set CTX explicitly." >&2
         exit 1
     fi
-    if [ "$VISION" = 1 ] && [ "$MTP" = 1 ]; then CTX=81920
-    elif [ "$VISION" = 1 ];                then CTX=139264
-    elif [ "$MTP" = 1 ];                   then CTX=131072
-    else                                        CTX=196608
+    if [ "$MAX_CONCURRENCY" = 1 ]; then
+        if [ "$VISION" = 1 ] && [ "$MTP" = 1 ]; then CTX=81920
+        elif [ "$VISION" = 1 ];                then CTX=139264
+        elif [ "$MTP" = 1 ];                   then CTX=131072
+        else                                        CTX=196608
+        fi
+    elif [ "$VISION" = 1 ] && [ "$MTP" = 1 ]; then
+        # Only this feature combination was measured above concurrency 1.
+        case "$MAX_CONCURRENCY" in
+            2) CTX=81920 ;;
+            3) CTX=57344 ;;
+            4) CTX=32768 ;;
+            *) echo "serve.sh: no measured context for MAX_CONCURRENCY=$MAX_CONCURRENCY, set CTX explicitly." >&2
+               exit 1 ;;
+        esac
+    else
+        echo "serve.sh: above MAX_CONCURRENCY=1 only vision=1 mtp=1 was measured." >&2
+        echo "          You have vision=$VISION mtp=$MTP, so set CTX explicitly." >&2
+        exit 1
     fi
-    echo "serve.sh: vision=$VISION mtp=$MTP -> --max-context $CTX (measured, see header)" >&2
+    echo "serve.sh: vision=$VISION mtp=$MTP concurrency=$MAX_CONCURRENCY -> --max-context $CTX (measured, see header)" >&2
 fi
 
 ARGS=("$MODEL"

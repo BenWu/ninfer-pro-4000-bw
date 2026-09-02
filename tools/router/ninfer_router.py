@@ -18,7 +18,7 @@ Shape only breaks ties between backends that are equally warm and equally idle.
 Usage:
     python3 tools/router/ninfer_router.py --port 8090 \
         --backend blackwell=http://127.0.0.1:8080,max_context=81920,prefill=3860,decode=57.4,attn=2.493e-9 \
-        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,affinity_slots=1
+        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,affinity_slots=2
 """
 import argparse
 import collections
@@ -38,11 +38,12 @@ from http.server import BaseHTTPRequestHandler
 CHARS_PER_TOKEN = 3.0
 
 # How many contexts a card holds. The two forks differ, so this is per backend.
-# The Blackwell fork's context cache derives two private continuations plus one
-# shared prefix at --max-concurrency 1, and alternating two documents does keep
-# both. The 4090 fork has no such cache: its reuse is a retained-sequence check,
-# and it holds exactly one context. Alternating two 4000 word documents there,
-# a repeat costs 27.8ms while every alternation pays the full 7.85s prefill.
+# The Blackwell fork has a context cache and derives two private continuations
+# plus one shared prefix at --max-concurrency 1. The 4090 fork has no such
+# cache: reuse is per lane, against the sequence that lane retained, so it holds
+# exactly as many contexts as it has lanes. Alternating two 4000 word documents
+# there paid the full 7.8s prefill every time at concurrency 1 and hit in 29ms
+# at concurrency 2, so set affinity_slots to that server's --max-concurrency.
 # Tracking more slots than a card has promises hits it cannot honour.
 AFFINITY_SLOTS = 3
 

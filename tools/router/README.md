@@ -69,29 +69,35 @@ card restart. It is proxied unchanged instead.
 | `attn` | quadratic attention coefficient in seconds per token squared |
 | `decode` | decode rate in tokens per second |
 | `affinity_min_tokens` | below this a prefix is assumed not retained, default 2048 |
-| `affinity_slots` | contexts the card holds, default 3, **use 1 for the 4090** |
+| `affinity_slots` | contexts the card holds, default 3; on the 4090 set it to that server's `--max-concurrency` |
 
 ### The two forks retain differently
 
 They are different engine lineages, and it changes how many conversations each
-card can keep warm. The Blackwell fork has a cost-model driven context cache
-(`src/runtime/engine/context_cost.cpp`, about 9600 lines in `runtime/engine`).
-The 4090 fork has none: reuse is a retained-sequence check
-(`request_plan_impl.h:182`, about 2500 lines), and it holds exactly one context.
+card keeps warm. The Blackwell fork has a cost-model driven context cache
+(`src/runtime/engine/context_cost.cpp`, about 9600 lines in `runtime/engine`)
+and holds two private continuations plus one shared prefix at concurrency 1.
+The 4090 fork has no such cache: reuse is per lane, against the sequence that
+lane retained (`request_plan_impl.h:182`, about 2500 lines), so it holds exactly
+one context per lane.
 
-Alternating two 4000 word documents, time to first token:
+Alternating two 4000 word documents on the 4090, time to first token:
 
-| | cold | repeat | alternating |
-|---|---|---|---|
-| Blackwell, calibrated presets | 7.9 s | 0.09 s | 6 of 6 hits |
-| RTX 4090 | 7.8 s | **0.028 s** | 0 of 6, every one pays 7.85 s |
+| `--max-concurrency` | alternating A B A B |
+|---|---|
+| 1 | 7.8 s every time, no reuse at all |
+| 2 | **29 ms** every time |
 
-The 4090 is faster on a hit and useless on an alternation. Setting
-`affinity_slots=1` for it stops the router promising a hit that card cannot
-give. This is architectural rather than a misconfiguration:
-`--context-cost-presets` cannot be ported to that fork without backporting the
-whole context-cache subsystem, since it has no `ContextCacheOptions`,
-`max_shared_prefixes` or `max_private_continuations` at all.
+So the 4090's retention is set by its concurrency, and raising it to 2 is free
+there: it still fits the full 262144 context with 519 MiB spare, and a single
+request decodes at 120.2 tok/s either way. Only real 2-way load costs anything,
+87.3 tok/s per stream for 150.1 aggregate. Set `affinity_slots` to whatever that
+server runs.
+
+This is also why `--context-cost-presets` is not portable to that fork and would
+not help if it were. The flag parameterizes a cost model that arbitrates inside
+a context cache the 4090 does not have, so the flag alone would be inert, and
+the retention it was meant to fix is a concurrency setting instead.
 
 ## Measured coefficients
 

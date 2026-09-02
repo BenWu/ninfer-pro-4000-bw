@@ -137,11 +137,92 @@ def test_mismatched_models_are_refused():
     check("a backend that is not up yet is a warning, not a refusal", tolerated)
 
 
+def test_failover_to_a_live_backend():
+    live = 9507
+    mock_backend.serve(live, 3000, 60, 200000, 400.0)
+    dead = ninfer_router.Backend("dead", "http://127.0.0.1:9598", 200000, 3000, 60)
+    good = ninfer_router.Backend("live", f"http://127.0.0.1:{live}", 200000, 3000, 60)
+    server, router = start_router(9508, [dead, good])
+
+    body = {"model": "m", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]}
+    served = None
+    try:
+        served = urllib.request.urlopen(urllib.request.Request(
+            "http://127.0.0.1:9508/v1/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json"}), timeout=30).read()
+    except Exception as exc:
+        served = None
+        detail = str(exc)
+    check("a request lands on the live backend when one is down", bool(served),
+          locals().get("detail", ""))
+    check("the dead backend is taken out of rotation", dead.healthy is False,
+          "still marked healthy")
+    check("the live backend stays in rotation", good.healthy is True)
+
+    # It comes back, and a probe restores it.
+    mock_backend.serve(9598, 3000, 60, 200000, 400.0)
+    router.probe_unhealthy()
+    check("a backend that comes back is restored", dead.healthy is True,
+          "still marked unreachable")
+    server.shutdown()
+    server.server_close()
+
+
+def test_midstream_failure_is_not_retried():
+    a, b = 9509, 9510
+    mock_backend.serve(a, 3000, 60, 200000, 400.0)
+    mock_backend.serve(b, 3000, 60, 200000, 400.0)
+    one = ninfer_router.Backend("one", f"http://127.0.0.1:{a}", 200000, 3000, 60)
+    two = ninfer_router.Backend("two", f"http://127.0.0.1:{b}", 200000, 3000, 60)
+    server, router = start_router(9511, [one, two])
+
+    body = {"model": "m", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "CUT-ME please"}]}
+    try:
+        payload = urllib.request.urlopen(urllib.request.Request(
+            "http://127.0.0.1:9511/v1/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json"}), timeout=30).read()
+    except Exception:
+        payload = b""
+    # Exactly one backend should have seen it: retrying after bytes were sent
+    # would put a second partial response on the same connection.
+    total = payload.count(b"partial")
+    check("a mid-stream cut is not retried into a duplicate", total <= 1,
+          f"client saw {total} partial responses")
+    server.shutdown()
+    server.server_close()
+
+
+def test_affinity_slots_follow_concurrency():
+    blackwell = ninfer_router.Backend("bw", "http://x", 98304, 3860, 57.4,
+                                      concurrency=1, slots_per_lane=3)
+    check("Blackwell at concurrency 1 gets 3 slots", blackwell.affinity_slots == 3,
+          f"got {blackwell.affinity_slots}")
+    blackwell2 = ninfer_router.Backend("bw2", "http://x", 73728, 3860, 57.4,
+                                       concurrency=2, slots_per_lane=3)
+    check("Blackwell at concurrency 2 gets 6 slots", blackwell2.affinity_slots == 6,
+          f"got {blackwell2.affinity_slots}")
+    gpu = ninfer_router.Backend("4090", "http://x", 262144, 2115, 108.0,
+                                concurrency=2, slots_per_lane=1)
+    check("the 4090 at concurrency 2 gets 2 slots", gpu.affinity_slots == 2,
+          f"got {gpu.affinity_slots}")
+    override = ninfer_router.Backend("o", "http://x", 1000, 1, 1,
+                                     concurrency=4, slots_per_lane=3, affinity_slots=2)
+    check("an explicit affinity_slots still wins", override.affinity_slots == 2,
+          f"got {override.affinity_slots}")
+
+
 def main():
     print("failure and identity behaviour")
     test_failed_request_forgets_affinity()
     test_client_disconnect_frees_the_backend()
     test_mismatched_models_are_refused()
+    test_failover_to_a_live_backend()
+    test_midstream_failure_is_not_retried()
+    test_affinity_slots_follow_concurrency()
     if FAILURES:
         print(f"\nFAIL: {len(FAILURES)} check(s) failed")
         return 1

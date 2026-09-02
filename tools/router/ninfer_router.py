@@ -17,8 +17,8 @@ Shape only breaks ties between backends that are equally warm and equally idle.
 
 Usage:
     python3 tools/router/ninfer_router.py --port 8090 \
-        --backend blackwell=http://127.0.0.1:8080,max_context=81920,prefill=3860,decode=57.4,attn=2.493e-9 \
-        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,affinity_slots=2
+        --backend blackwell=http://127.0.0.1:8080,max_context=98304,prefill=3860,decode=57.4,attn=2.493e-9,concurrency=1,slots_per_lane=3 \
+        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,concurrency=2,slots_per_lane=1
 """
 import argparse
 import collections
@@ -49,15 +49,22 @@ TOKENS_PER_IMAGE = 1024
 # underprice decode and bias placement toward the slower-decoding card.
 DEFAULT_MAX_TOKENS = 8192
 
-# How many contexts a card holds. The two forks differ, so this is per backend.
-# The Blackwell fork has a context cache and derives two private continuations
-# plus one shared prefix at --max-concurrency 1. The 4090 fork has no such
-# cache: reuse is per lane, against the sequence that lane retained, so it holds
-# exactly as many contexts as it has lanes. Alternating two 4000 word documents
-# there paid the full 7.8s prefill every time at concurrency 1 and hit in 29ms
-# at concurrency 2, so set affinity_slots to that server's --max-concurrency.
-# Tracking more slots than a card has promises hits it cannot honour.
-AFFINITY_SLOTS = 3
+# How many contexts a card holds per lane. Both forks scale with the server's
+# --max-concurrency, but by a different factor, so this is per backend.
+#
+# The Blackwell fork has a context cache whose capacities are derived from
+# concurrency: two private continuations plus one shared prefix per lane
+# (engine.cpp:62), so three. The 4090 fork has no such cache. Its reuse is per
+# lane, against the sequence that lane retained, so it holds exactly one per
+# lane: alternating two 4000 word documents paid the full 7.8s prefill every
+# time at concurrency 1 and hit in 29ms at concurrency 2.
+#
+# Tracking more slots than a card has promises hits it cannot honour, so set
+# concurrency to match the server and slots_per_lane to match its fork.
+SLOTS_PER_LANE = 3
+
+# How often to re-probe a backend that stopped answering.
+HEALTH_PROBE_SECONDS = 5.0
 
 # Retention is a cost model decision inside the engine, not a fixed rule, so this
 # is a measured floor rather than a policy. Cycling two prompts on the Blackwell
@@ -72,7 +79,7 @@ AFFINITY_MIN_TOKENS = 2048
 class Backend:
     def __init__(self, name, url, max_context, prefill_tok_s, decode_tok_s,
                  affinity_min_tokens=AFFINITY_MIN_TOKENS, attention_s_per_token2=0.0,
-                 affinity_slots=AFFINITY_SLOTS):
+                 affinity_slots=None, concurrency=1, slots_per_lane=SLOTS_PER_LANE):
         self.name = name
         self.url = url.rstrip("/")
         self.max_context = max_context
@@ -87,7 +94,13 @@ class Backend:
         self.prefixes = collections.OrderedDict()   # prefix hash -> token estimate
         self.stats = collections.Counter()
         self.affinity_min_tokens = affinity_min_tokens
-        self.affinity_slots = max(1, affinity_slots)
+        self.concurrency = max(1, concurrency)
+        self.slots_per_lane = max(1, slots_per_lane)
+        self.affinity_slots = max(1, affinity_slots if affinity_slots is not None
+                                  else self.concurrency * self.slots_per_lane)
+        # Set false when the backend stops answering, so a restart takes it out
+        # of rotation instead of failing one request after another into it.
+        self.healthy = True
         # Estimated work already committed to this backend. Counting jobs and
         # multiplying by an average badly misprices a queue whose jobs differ by
         # more than an order of magnitude, which is exactly the traffic here:
@@ -244,18 +257,25 @@ class Router:
         self.log = log
         self.lock = threading.Lock()
 
-    def choose(self, request):
+    def choose(self, request, exclude=()):
         prompt_tokens = estimate_prompt_tokens(request)
         output_tokens = request["max_tokens"] or DEFAULT_MAX_TOKENS
         hashes = prefix_hashes(request["preamble"], request["system"], request["messages"])
 
         with self.lock:
-            fits = [b for b in self.backends
+            usable = [b for b in self.backends if b not in exclude]
+            # Prefer backends that are answering, but if none are, try anyway
+            # rather than refusing: a probe may simply not have caught up yet.
+            answering = [b for b in usable if b.healthy]
+            usable = answering or usable
+            if not usable:
+                return None, "no-backend", prompt_tokens, 0.0, hashes
+            fits = [b for b in usable
                     if prompt_tokens + output_tokens <= b.max_context]
             if not fits:
                 # Nothing fits the estimate. Send it to the largest context and
                 # let the server return its own error rather than inventing one.
-                fits = [max(self.backends, key=lambda b: b.max_context)]
+                fits = [max(usable, key=lambda b: b.max_context)]
                 reason = "no-fit"
             else:
                 reason = None
@@ -327,12 +347,30 @@ class Router:
             if not succeeded:
                 backend.forget(hashes)
 
+    def mark(self, backend, healthy):
+        with self.lock:
+            if backend.healthy != healthy:
+                backend.healthy = healthy
+                self.log(f"{backend.name} is now {'up' if healthy else 'unreachable'}")
+
+    def probe_unhealthy(self):
+        """Restore backends that have started answering again."""
+        for backend in self.backends:
+            if backend.healthy:
+                continue
+            try:
+                with urllib.request.urlopen(backend.url + "/health", timeout=2):
+                    self.mark(backend, True)
+            except Exception:
+                pass
+
     def snapshot(self):
         with self.lock:
             return {b.name: {"url": b.url, "queued": b.queued,
                              "pending_seconds": round(b.pending_seconds, 3),
                              "max_context": b.max_context,
                              "warm_prefixes": f"{len(b.prefixes)}/{b.affinity_slots}",
+                             "healthy": b.healthy,
                              "routed": dict(b.stats)} for b in self.backends}
 
 
@@ -447,37 +485,67 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self._send_json(400, {"error": {"message": "body must be an object"}})
 
-        backend, reason, prompt_tokens, committed, hashes = self.router.choose(adapter(body))
-        started = time.perf_counter()
-        waited = 0.0
-        succeeded = False
-        try:
-            # One in flight per backend. Holding the queue here rather than in
-            # the server is what keeps a short request from waiting behind a
-            # long prefill it never needed to follow.
-            with backend.lock:
-                waited = time.perf_counter() - started
-                succeeded = self._stream_from(backend, path, raw)
-        finally:
-            self.router.release(backend, committed, hashes, succeeded)
-        self.router.log(f"{backend.name:10s} {path:22s} {reason:32s} "
-                        f"~{prompt_tokens:>7} tok wait={waited * 1000:7.1f}ms"
-                        f"{'' if succeeded else '  [incomplete]'}")
+        request = adapter(body)
+        tried = []
+        last_error = None
+        # Retry only while nothing has reached the client yet. Once the first
+        # chunk is out, a second attempt would duplicate the response, so a
+        # mid-stream failure has to stay a failure.
+        for _ in range(len(self.router.backends)):
+            backend, reason, prompt_tokens, committed, hashes = self.router.choose(
+                request, exclude=tried)
+            if backend is None:
+                break
+            started = time.perf_counter()
+            waited = 0.0
+            outcome = "failed"
+            try:
+                # One in flight per backend. Holding the queue here rather than
+                # in the server is what keeps a short request from waiting
+                # behind a long prefill it never needed to follow.
+                with backend.lock:
+                    waited = time.perf_counter() - started
+                    outcome, last_error = self._attempt(backend, path, raw)
+            finally:
+                self.router.release(backend, committed, hashes, outcome == "ok")
+            note = "" if outcome == "ok" else f"  [{outcome}]"
+            self.router.log(f"{backend.name:10s} {path:22s} {reason:32s} "
+                            f"~{prompt_tokens:>7} tok wait={waited * 1000:7.1f}ms{note}")
+            if outcome != "retry":
+                return
+            tried.append(backend)
 
-    def _stream_from(self, backend, path, raw):
+        if isinstance(last_error, urllib.error.HTTPError):
+            return self._relay_error(last_error)
+        self._send_json(502, {"error": {"message": f"no backend could serve the request: "
+                                                   f"{last_error}"}})
+
+    def _attempt(self, backend, path, raw):
+        """One try against one backend.
+
+        Returns (outcome, error). "retry" means nothing reached the client and
+        another backend may serve it; "ok", "failed" and "client-gone" are all
+        final.
+        """
         req = urllib.request.Request(backend.url + path, data=raw,
                                      headers=self._forward_headers())
         try:
             upstream = urllib.request.urlopen(req, timeout=1800)
         except urllib.error.HTTPError as exc:
+            # A 4xx is the request's own fault and would fail identically
+            # elsewhere. A 5xx might not, so it is worth one more card.
+            if exc.code >= 500:
+                return "retry", exc
             self._relay_error(exc)
-            return False
+            return "failed", exc
         except Exception as exc:
-            self._send_json(502, {"error": {"message": f"upstream {backend.name}: {exc}"}})
-            return False
+            # Refused or dropped: the server is likely restarting.
+            self.router.mark(backend, False)
+            return "retry", exc
 
+        self.router.mark(backend, True)
         with upstream:
-            return self._relay(upstream)
+            return ("ok", None) if self._relay(upstream) else ("client-gone", None)
 
 
 class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -496,7 +564,9 @@ def parse_backend(spec):
                    float(opts.get("decode", 40)),
                    int(opts.get("affinity_min_tokens", AFFINITY_MIN_TOKENS)),
                    float(opts.get("attn", 0.0)),
-                   int(opts.get("affinity_slots", AFFINITY_SLOTS)))
+                   int(opts["affinity_slots"]) if "affinity_slots" in opts else None,
+                   int(opts.get("concurrency", 1)),
+                   int(opts.get("slots_per_lane", SLOTS_PER_LANE)))
 
 
 def backend_model_id(backend, timeout=5):
@@ -539,7 +609,7 @@ def main():
     ap.add_argument("--backend", action="append", required=True,
                     help="name=url[,max_context=N][,prefill=tok/s][,decode=tok/s]"
                          "[,attn=s_per_token_squared][,affinity_min_tokens=N]"
-                         "[,affinity_slots=N]")
+                         "[,concurrency=N][,slots_per_lane=N][,affinity_slots=N]")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -550,7 +620,15 @@ def main():
             print(line, file=sys.stderr, flush=True)
 
     check_backends(backends, log)
-    Handler.router = Router(backends, log)
+    router = Router(backends, log)
+
+    def probe_forever():
+        while True:
+            time.sleep(HEALTH_PROBE_SECONDS)
+            router.probe_unhealthy()
+
+    threading.Thread(target=probe_forever, daemon=True).start()
+    Handler.router = router
     server = ThreadedServer((args.host, args.port), Handler)
     log(f"router on http://{args.host}:{args.port} -> " +
         ", ".join(f"{b.name}({b.max_context})" for b in backends))

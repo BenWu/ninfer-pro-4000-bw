@@ -93,6 +93,19 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
         state = self.state
+        # A request the caller wants cut off after streaming has started, for
+        # checking that a mid-stream failure is not retried into a duplicate.
+        if "CUT-ME" in json.dumps(body.get("messages") or []):
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            chunk = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+            self.wfile.flush()
+            self.close_connection = True
+            state.served += 1
+            return
         # A request the caller wants to fail, for exercising rollback paths.
         if "FAIL-ME" in json.dumps(body.get("messages") or []):
             blob = json.dumps({"error": {"message": "synthetic failure"}}).encode()

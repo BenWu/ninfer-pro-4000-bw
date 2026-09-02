@@ -69,7 +69,14 @@ card restart. It is proxied unchanged instead.
 | `attn` | quadratic attention coefficient in seconds per token squared |
 | `decode` | decode rate in tokens per second |
 | `affinity_min_tokens` | below this a prefix is assumed not retained, default 2048 |
-| `affinity_slots` | contexts the card holds, default 3; on the 4090 set it to that server's `--max-concurrency` |
+| `concurrency` | that server's `--max-concurrency`, default 1 |
+| `slots_per_lane` | contexts retained per lane: 3 on the Blackwell fork, 1 on the 4090 |
+| `affinity_slots` | overrides `concurrency * slots_per_lane` if you would rather set it directly |
+
+Retention scales with the server's concurrency on both forks, but by a different
+factor. The Blackwell fork derives two private continuations plus one shared
+prefix per lane (`engine.cpp:62`). The 4090 fork retains one sequence per lane.
+So the Blackwell at concurrency 1 holds 3 and the 4090 at concurrency 2 holds 2.
 
 ### The two forks retain differently
 
@@ -266,6 +273,22 @@ admission flag that changes this.
 So the two are complementary rather than alternatives. Concurrency 2 on each
 card buys aggregate throughput; the router buys protection from long prefills.
 `serve.sh` picks a measured context for concurrency 1 to 4.
+
+## When a backend restarts
+
+A backend that refuses a connection is taken out of rotation and the request is
+retried on another card, so a restart costs one retry rather than a failed
+request. A `/health` probe every 5 seconds puts it back when it returns.
+`/router/status` reports `healthy` per backend.
+
+Retries only happen while nothing has reached the client. Once the first chunk
+is out, a second attempt would put a duplicate response on the same connection,
+so a mid-stream failure stays a failure. A 4xx is never retried either, since it
+is the request's own fault and would fail identically on the other card.
+
+Verified against both servers: killing the 4090 mid-operation left every request
+answering 200, logged `rtx4090 is now unreachable`, and restarting it logged
+`rtx4090 is now up` with no intervention.
 
 ## Limitations
 

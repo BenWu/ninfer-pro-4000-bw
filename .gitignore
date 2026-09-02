@@ -31,7 +31,11 @@ venv/
 *.gguf
 *.ninfer
 *.ninfer.conversion.json
-/models/
+/models/*
+# Measured context-cost coefficients, small and specific to this machine. They
+# drive context-cache retention and cost a GPU calibration run to regenerate,
+# so they are tracked even though the artifacts beside them are not.
+!/models/context_cost_presets.json
 out/
 
 # Local workspace and transient runtime output

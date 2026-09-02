@@ -1,0 +1,88 @@
+{
+  "artifact_type": "ninfer_context_cost_presets",
+  "machines": [
+    {
+      "hardware_class": "nvidia-rtx-pro-4000-blackwell-sm120",
+      "prefill": [
+        {
+          "coefficients": {
+            "attention_pair_ns_q32": 27135854920,
+            "chunk_ns": 30386230,
+            "token_ns_q32": 3728031316718750,
+            "vision_item_ns": 4437917,
+            "vision_patch_ns_q32": 75003418542471
+          },
+          "model_id": "qwen3.8-27b",
+          "provenance": {
+            "artifact_path": "models/qwen3_8_27b.ninfer",
+            "compute_capability": "12.0",
+            "corpus": "bench/fixtures/bench_corpus.ids",
+            "cuda_driver": "13.3",
+            "cuda_runtime": "13.3",
+            "device": 1,
+            "gpu": "NVIDIA RTX PRO 4000 Blackwell",
+            "max_context": 8192,
+            "prefill_chunk": 1024,
+            "prefill_repetitions": 5,
+            "suite": "prefill",
+            "target": "qwen3_8_27b"
+          },
+          "weights_id": "groupwise-int"
+        },
+        {
+          "coefficients": {
+            "attention_pair_ns_q32": 19441062850,
+            "chunk_ns": 18586191,
+            "token_ns_q32": 1047575710182168,
+            "vision_item_ns": 4462111,
+            "vision_patch_ns_q32": 73577597807360
+          },
+          "model_id": "qwen3.8-27b",
+          "provenance": {
+            "artifact_path": "models/qwen3_8_27b_nvfp4.ninfer",
+            "compute_capability": "12.0",
+            "corpus": "bench/fixtures/bench_corpus.ids",
+            "cuda_driver": "13.3",
+            "cuda_runtime": "13.3",
+            "device": 1,
+            "gpu": "NVIDIA RTX PRO 4000 Blackwell",
+            "max_context": 8192,
+            "prefill_chunk": 1024,
+            "prefill_repetitions": 5,
+            "suite": "prefill",
+            "target": "qwen3_8_27b"
+          },
+          "weights_id": "nvfp4"
+        }
+      ],
+      "transfer": {
+        "d2d": {
+          "batch_ns": 4231,
+          "ns_per_byte_q32": 10390883,
+          "operation_ns": 1405
+        },
+        "d2h": {
+          "batch_ns": 75486,
+          "ns_per_byte_q32": 305940383,
+          "operation_ns": 176
+        },
+        "h2d": {
+          "batch_ns": 36842,
+          "ns_per_byte_q32": 346803998,
+          "operation_ns": 1920
+        }
+      },
+      "transfer_provenance": {
+        "compute_capability": "12.0",
+        "cuda_driver": "13.3",
+        "cuda_runtime": "13.3",
+        "device": 1,
+        "gpu": "NVIDIA RTX PRO 4000 Blackwell",
+        "suite": "transfer",
+        "transfer_repetitions": 9,
+        "transfer_warmup": 2
+      }
+    }
+  ],
+  "schema_version": 2
+}

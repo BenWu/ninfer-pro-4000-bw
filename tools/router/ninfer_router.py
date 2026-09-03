@@ -10,15 +10,16 @@ The measured facts this is built on, all from this machine (see README.md):
     prefill waits for all of it: a 0.6 second call measured 11.6 seconds. The
     queue therefore lives here, one in flight per backend, and never in the
     server where the router cannot see or reorder it.
-  - The Pro 4000 holds 81920 tokens of context against the 4090's 262144, so
-    long prompts are a placement constraint before they are a preference.
+  - The Pro 4000 holds 147456 tokens of context (its MTP-only default, no
+    vision) against the 4090's 262144 (vision on), so long prompts are a
+    placement constraint before they are a preference.
 
 Shape only breaks ties between backends that are equally warm and equally idle.
 
 Usage:
     python3 tools/router/ninfer_router.py --port 8090 \
-        --backend pro4000=http://127.0.0.1:8080,max_context=98304,prefill=3860,decode=57.4,attn=2.493e-9,concurrency=1,slots_per_lane=3 \
-        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,concurrency=2,slots_per_lane=1
+        --backend pro4000=http://127.0.0.1:8080,max_context=147456,prefill=3860,decode=57.4,attn=2.493e-9,concurrency=1,slots_per_lane=3,vision=0 \
+        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,concurrency=2,slots_per_lane=1,vision=1
 """
 import argparse
 import collections

@@ -153,14 +153,14 @@ def main():
                      run_trace(urls, trace, lambda t, i: t[i % len(t)], path=ep)))
 
         backends = [
-            ninfer_router.Backend("pro4000", urls[0], 98304, 3860, 57.4,
+            ninfer_router.Backend("pro4000", urls[0], 147456, 3860, 57.4,
                                   attention_s_per_token2=2.493e-9,
-                                  concurrency=1, slots_per_lane=3),
+                                  concurrency=1, slots_per_lane=3, vision=False),
             # The 4090 fork has no context cache: reuse is per lane, so it
-            # holds one context per --max-concurrency. It runs 2.
+            # holds one context per --max-concurrency. It runs 2, with vision.
             ninfer_router.Backend("rtx4090", urls[1], 262144, 2115, 108.0,
                                   attention_s_per_token2=1.619e-9,
-                                  concurrency=2, slots_per_lane=1),
+                                  concurrency=2, slots_per_lane=1, vision=True),
         ]
         handler = type("H", (ninfer_router.Handler,), {
             "router": ninfer_router.Router(backends, lambda line: None)})

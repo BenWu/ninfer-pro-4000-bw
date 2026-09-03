@@ -19,21 +19,24 @@ behind a cold 32k prefill. The queue therefore lives in the router, one in
 flight per backend, and never in the server, where it is FIFO and invisible:
 `/health` returns a static `{"status":"ok"}` with no depth or load.
 
-**The cards do not hold the same context.** `serve.sh` gives the Pro 4000 81920
-tokens with vision and MTP3 enabled, against 262144 on the 4090. A prompt above
-the smaller ceiling is a placement constraint before it is a preference.
+**The cards do not hold the same context.** `serve.sh` gives the Pro 4000 147456
+tokens (its MTP-only default, no vision), against 262144 on the 4090 (vision on).
+A prompt above the smaller ceiling is a placement constraint before it is a
+preference.
 
 Shape only breaks ties between backends that are equally warm and equally idle.
 
 ## Running it
 ```sh
 python3 tools/router/ninfer_router.py --port 8080 \
-    --backend pro4000=http://127.0.0.1:8081,max_context=147456,prefill=3860,decode=57.4,attn=2.493e-9 \
-    --backend rtx4090=http://127.0.0.1:8082,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9
+    --backend pro4000=http://127.0.0.1:8081,max_context=147456,prefill=3860,decode=57.4,attn=2.493e-9,vision=0 \
+    --backend rtx4090=http://127.0.0.1:8082,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,vision=1
 ```
 
-Clients point at the router instead of a server. `/router/status` reports queue
-depth, committed work, and placement counts.
+The Pro 4000 runs `serve.sh`'s MTP-only default, which does not enable `--vision`,
+so it carries `vision=0` and image requests are routed to the 4090 instead. Clients
+point at the router rather than a server; `/router/status` reports queue depth,
+committed work, and placement counts.
 
 ### Which endpoints are routed
 
@@ -119,10 +122,10 @@ Both cards in the configuration their launch scripts use, meaning
 | prefill at 2442 tokens | **0.77 s** | 1.28 s |
 | prefill at 32045 tokens | **10.84 s** | 16.79 s |
 | prefill at 62966 tokens | **26.20 s** | 36.20 s |
-| prefill at 123636 tokens | over context | 83.19 s |
+| prefill at 123636 tokens | fits (not measured) | 83.19 s |
 | fitted `prefill` | 3860 tok/s | 2115 tok/s |
 | fitted `attn` | 2.493e-9 | 1.619e-9 |
-| `max_context` | 81920 | 262144 |
+| `max_context` | 147456 | 262144 |
 
 `prefill` alone is not enough at long lengths. Fitting `t/prefill + attn * t^2`
 reproduces every point above 30k within 0.2%, while a flat rate tuned to the
@@ -132,9 +135,10 @@ coefficient, so the Pro 4000's prefill lead narrows with length: 1.66x at 2.4k,
 
 ### The resulting shape rule
 
-For a cold request the Pro 4000 wins when the prompt is more than about 40
-times the generation, near enough flat across the range (38 at 1k, 44 at 32k,
-57 at the 81920 ceiling). Worked examples:
+For a cold request the Pro 4000 wins when the prompt is more than about 40 times
+the generation; the winning range widens as the prompt grows, because the Pro 4000's
+prefill-rate lead (3860 vs 2115 tok/s) dominates the decode-rate difference (38 at
+1k, 44 at 32k, 96 at the 147456 ceiling). Worked examples:
 
 | shape | Pro 4000 | 4090 | winner |
 |---|---|---|---|
@@ -149,7 +153,7 @@ This only applies to cold requests. A warm prefix on the other card overrides it
 ## Calibrating a backend
 
     python3 tools/router/shape_bench.py --server http://127.0.0.1:8080 \
-        --label pro4000 --out bw.json --max-context 81920 --repeat 1 \
+        --label pro4000 --out bw.json --max-context 147456 --repeat 1 \
         --prompts models/retrieval_spot.json models/long_prompt_32tok.json \
                   models/long_prompt_64tok.json
 

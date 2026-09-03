@@ -198,7 +198,7 @@ def test_midstream_failure_is_not_retried():
 
 
 def test_affinity_slots_follow_concurrency():
-    pro4000 = ninfer_router.Backend("bw", "http://x", 98304, 3860, 57.4,
+    pro4000 = ninfer_router.Backend("bw", "http://x", 147456, 3860, 57.4,
                                       concurrency=1, slots_per_lane=3)
     check("Pro 4000 at concurrency 1 gets 3 slots", pro4000.affinity_slots == 3,
           f"got {pro4000.affinity_slots}")

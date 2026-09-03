@@ -24,7 +24,8 @@
 #
 # Raising MAX_CONCURRENCY lowers every entry, because the context-cache defaults scale off it
 # (device-state slots = concurrency, private continuations = 2x, shared prefixes = 1x). Measured
-# for vision + MTP3, the combination this script defaults to:
+# for vision + MTP3, the only combination with values above concurrency 1 (enable it with
+# VISION=1 MTP=1). The default is MTP-only, which has no measured value above concurrency 1:
 #
 #   concurrency   ceiling             default picked      slack at the default
 #   1             106496 (122 MiB)     98304              274 MiB
@@ -51,11 +52,11 @@
 # For any other KV dtype, or above concurrency 1 with a different feature combination, the script
 # asks for CTX explicitly.
 #
-# Usage:  ./serve.sh                     vision + MTP3, context chosen automatically
-#         VISION=0 ./serve.sh            drop vision, context rises to 147456
-#         CTX=106496 ./serve.sh          run at the measured ceiling instead
-#         MAX_CONCURRENCY=2 ./serve.sh   double aggregate decode, context falls to 73728
-#         ./serve.sh --greedy            extra flags are passed through to ninfer-serve
+# Usage:  ./serve.sh                                    MTP-only (default), context 147456
+#         VISION=1 MTP=1 ./serve.sh                     vision + MTP3, context 98304
+#         CTX=155648 ./serve.sh                         MTP-only at its measured ceiling
+#         VISION=1 MTP=1 MAX_CONCURRENCY=2 ./serve.sh   vision+MTP3 conc 2, context 73728
+#         ./serve.sh --greedy                           extra flags are passed through to ninfer-serve
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 

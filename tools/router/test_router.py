@@ -17,7 +17,7 @@ import mock_backend                                   # noqa: E402
 import ninfer_router                                  # noqa: E402
 
 SPEED = 60.0
-BW = dict(prefill=3350, decode=57, max_context=81920)
+BW = dict(prefill=3350, decode=57, max_context=147456)
 GPU4090 = dict(prefill=1893, decode=51, max_context=262144)
 
 
@@ -194,20 +194,21 @@ def main():
         best_baseline = min(statistics.mean(results["single"]),
                             statistics.mean(results["round-robin"]))
         routed = statistics.mean(results["router"])
-        # The router must never be materially worse than simply picking the
-        # better of the two fixed policies, which is the honest bar: a router
-        # that only wins on traces chosen to suit it is not worth running.
-        if routed > best_baseline * 1.05:
+        # The router must beat the better of the two fixed policies, not merely
+        # match them: a round-robin passthrough equals best_baseline and would
+        # clear any "within 5%" floor, so the bar requires a strict improvement.
+        # The 5% margin keeps a flaky near-tie from flipping the result.
+        if routed > best_baseline * 0.95:
             failures.append(f"{name}: router {routed:.3f}s vs best baseline "
-                            f"{best_baseline:.3f}s")
+                            f"{best_baseline:.3f}s (must beat by >=5%)")
 
     if failures:
         print("\nFAIL")
         for line in failures:
             print("  " + line)
         return 1
-    print("\nPASS: router within 5% of the better fixed policy in every scenario, "
-          "and ahead of both where affinity or head of line blocking is in play")
+    print("\nPASS: router beats the better of the two fixed policies by >=5% in "
+          "every scenario")
     return 0
 
 

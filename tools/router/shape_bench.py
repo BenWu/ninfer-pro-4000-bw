@@ -8,7 +8,7 @@ separately, then reports both.
 
 Usage:
     python3 tools/router/shape_bench.py --server http://127.0.0.1:8080 \
-        --label blackwell --out bw.json
+        --label pro4000 --out bw.json
 """
 import argparse
 import json

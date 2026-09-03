@@ -6,7 +6,7 @@ This checks that those choices are worth making on the actual hardware, which is
 the only claim that matters. Run with both cards serving.
 
     python3 tools/router/live_bench.py \
-        --blackwell http://127.0.0.1:8080 --rtx4090 http://127.0.0.1:8081
+        --pro4000 http://127.0.0.1:8080 --rtx4090 http://127.0.0.1:8081
 """
 import argparse
 import json
@@ -126,7 +126,7 @@ def scenario_affinity(args, nonce=""):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--blackwell", required=True)
+    ap.add_argument("--pro4000", required=True)
     ap.add_argument("--rtx4090", required=True)
     ap.add_argument("--router-port", type=int, default=8099)
     ap.add_argument("--long-prompt", default="models/long_prompt_32tok.json")
@@ -135,7 +135,7 @@ def main():
                     choices=["/v1/messages", "/v1/chat/completions"])
     args = ap.parse_args()
 
-    urls = [args.blackwell, args.rtx4090]
+    urls = [args.pro4000, args.rtx4090]
     router_url = f"http://127.0.0.1:{args.router_port}"
 
     for build in (scenario_head_of_line, scenario_affinity):
@@ -145,7 +145,7 @@ def main():
 
         # Each policy gets its own nonce, so all four face equally cold caches.
         _, trace = build(args, "single-bw")
-        print(report("blackwell", run_trace([urls[0]], trace, lambda t, i: t[0], path=ep)))
+        print(report("pro4000", run_trace([urls[0]], trace, lambda t, i: t[0], path=ep)))
         _, trace = build(args, "single-gpu")
         print(report("rtx4090", run_trace([urls[1]], trace, lambda t, i: t[0], path=ep)))
         _, trace = build(args, "roundrobin")
@@ -153,7 +153,7 @@ def main():
                      run_trace(urls, trace, lambda t, i: t[i % len(t)], path=ep)))
 
         backends = [
-            ninfer_router.Backend("blackwell", urls[0], 98304, 3860, 57.4,
+            ninfer_router.Backend("pro4000", urls[0], 98304, 3860, 57.4,
                                   attention_s_per_token2=2.493e-9,
                                   concurrency=1, slots_per_lane=3),
             # The 4090 fork has no context cache: reuse is per lane, so it

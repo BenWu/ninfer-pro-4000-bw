@@ -50,7 +50,9 @@ def run_trace(targets, trace, policy, path="/v1/messages"):
             slot = counter["i"]
             counter["i"] += 1
         url = policy(targets, slot)
-        latencies[index] = call(url, body, path)
+        result = call(url, body, path)
+        with lock:
+            latencies[index] = result
 
     threads = []
     for index, body in enumerate(trace):
@@ -177,7 +179,7 @@ def main():
                 latencies = run_trace(urls, trace, lambda t, i: t[i % len(t)], path)
             else:
                 backends = [
-                    ninfer_router.Backend("blackwell", urls[0], BW["max_context"],
+                    ninfer_router.Backend("pro4000", urls[0], BW["max_context"],
                                           BW["prefill"], BW["decode"]),
                     ninfer_router.Backend("rtx4090", urls[1], GPU4090["max_context"],
                                           GPU4090["prefill"], GPU4090["decode"]),

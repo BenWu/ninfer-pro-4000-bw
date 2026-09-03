@@ -10,14 +10,14 @@ The measured facts this is built on, all from this machine (see README.md):
     prefill waits for all of it: a 0.6 second call measured 11.6 seconds. The
     queue therefore lives here, one in flight per backend, and never in the
     server where the router cannot see or reorder it.
-  - The Blackwell holds 81920 tokens of context against the 4090's 262144, so
+  - The Pro 4000 holds 81920 tokens of context against the 4090's 262144, so
     long prompts are a placement constraint before they are a preference.
 
 Shape only breaks ties between backends that are equally warm and equally idle.
 
 Usage:
     python3 tools/router/ninfer_router.py --port 8090 \
-        --backend blackwell=http://127.0.0.1:8080,max_context=98304,prefill=3860,decode=57.4,attn=2.493e-9,concurrency=1,slots_per_lane=3 \
+        --backend pro4000=http://127.0.0.1:8080,max_context=98304,prefill=3860,decode=57.4,attn=2.493e-9,concurrency=1,slots_per_lane=3 \
         --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9,concurrency=2,slots_per_lane=1
 """
 import argparse
@@ -52,7 +52,7 @@ DEFAULT_MAX_TOKENS = 8192
 # How many contexts a card holds per lane. Both forks scale with the server's
 # --max-concurrency, but by a different factor, so this is per backend.
 #
-# The Blackwell fork has a context cache whose capacities are derived from
+# The Pro 4000 fork has a context cache whose capacities are derived from
 # concurrency: two private continuations plus one shared prefix per lane
 # (engine.cpp:62), so three. The 4090 fork has no such cache. Its reuse is per
 # lane, against the sequence that lane retained, so it holds exactly one per
@@ -67,7 +67,7 @@ SLOTS_PER_LANE = 3
 HEALTH_PROBE_SECONDS = 5.0
 
 # Retention is a cost model decision inside the engine, not a fixed rule, so this
-# is a measured floor rather than a policy. Cycling two prompts on the Blackwell
+# is a measured floor rather than a policy. Cycling two prompts on the Pro 4000
 # with calibrated cost presets: 349 tokens never retained, 949 retained a third
 # of the time, 1949 half, 3943 and above every time. Below this the router must
 # not pin a request to a card for a hit the server will not give, because that
@@ -85,7 +85,7 @@ class Backend:
         self.max_context = max_context
         self.prefill_tok_s = prefill_tok_s
         self.decode_tok_s = decode_tok_s
-        # Prefill is not linear: measured on the Blackwell, a flat tokens per
+        # Prefill is not linear: measured on the Pro 4000, a flat tokens per
         # second rate underestimates a 63k prompt by 28%, and the gap widens
         # with length. Attention over the prompt is the quadratic part.
         self.attention_s_per_token2 = attention_s_per_token2
@@ -272,13 +272,12 @@ class Router:
                 return None, "no-backend", prompt_tokens, 0.0, hashes
             fits = [b for b in usable
                     if prompt_tokens + output_tokens <= b.max_context]
+            no_fit = not fits
             if not fits:
                 # Nothing fits the estimate. Send it to the largest context and
                 # let the server return its own error rather than inventing one.
                 fits = [max(usable, key=lambda b: b.max_context)]
-                reason = "no-fit"
-            else:
-                reason = None
+            reason = None
 
             warm = {b.name: b.warm_tokens(hashes) for b in fits}
             best_warm = max(warm.values())
@@ -331,7 +330,7 @@ class Router:
                 prompt_tokens, warm.get(chosen.name, 0), output_tokens)
             chosen.queued += 1
             chosen.pending_seconds += committed
-            chosen.stats[reason.split("(")[0]] += 1
+            chosen.stats[("no-fit" if no_fit else reason.split("(")[0])] += 1
             chosen.remember(hashes)
         return chosen, reason, prompt_tokens, committed, hashes
 

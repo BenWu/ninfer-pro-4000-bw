@@ -6,7 +6,7 @@ of the prefill and decode asymmetry between the two cards.
 
 ## What actually decides placement
 
-**A prefix hit is worth 108x.** A cold 32k prompt on the Blackwell takes 10.98
+**A prefix hit is worth 108x.** A cold 32k prompt on the Pro 4000 takes 10.98
 seconds to first token. The same prompt again takes 0.102 seconds, with
 `cache_read_input_tokens` reporting 32025 of 32030 reused. No other decision the
 router can make is within two orders of magnitude of that, so cache affinity
@@ -19,17 +19,18 @@ behind a cold 32k prefill. The queue therefore lives in the router, one in
 flight per backend, and never in the server, where it is FIFO and invisible:
 `/health` returns a static `{"status":"ok"}` with no depth or load.
 
-**The cards do not hold the same context.** `serve.sh` gives the Blackwell 81920
+**The cards do not hold the same context.** `serve.sh` gives the Pro 4000 81920
 tokens with vision and MTP3 enabled, against 262144 on the 4090. A prompt above
 the smaller ceiling is a placement constraint before it is a preference.
 
 Shape only breaks ties between backends that are equally warm and equally idle.
 
 ## Running it
-
-    python3 tools/router/ninfer_router.py --port 8090 \
-        --backend blackwell=http://127.0.0.1:8080,max_context=81920,prefill=3860,decode=57.4,attn=2.493e-9 \
-        --backend rtx4090=http://127.0.0.1:8081,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9
+```sh
+python3 tools/router/ninfer_router.py --port 8080 \
+    --backend pro4000=http://127.0.0.1:8081,max_context=147456,prefill=3860,decode=57.4,attn=2.493e-9 \
+    --backend rtx4090=http://127.0.0.1:8082,max_context=262144,prefill=2115,decode=108.0,attn=1.619e-9
+```
 
 Clients point at the router instead of a server. `/router/status` reports queue
 depth, committed work, and placement counts.
@@ -70,18 +71,18 @@ card restart. It is proxied unchanged instead.
 | `decode` | decode rate in tokens per second |
 | `affinity_min_tokens` | below this a prefix is assumed not retained, default 2048 |
 | `concurrency` | that server's `--max-concurrency`, default 1 |
-| `slots_per_lane` | contexts retained per lane: 3 on the Blackwell fork, 1 on the 4090 |
+| `slots_per_lane` | contexts retained per lane: 3 on the Pro 4000 fork, 1 on the 4090 |
 | `affinity_slots` | overrides `concurrency * slots_per_lane` if you would rather set it directly |
 
 Retention scales with the server's concurrency on both forks, but by a different
-factor. The Blackwell fork derives two private continuations plus one shared
+factor. The Pro 4000 fork derives two private continuations plus one shared
 prefix per lane (`engine.cpp:62`). The 4090 fork retains one sequence per lane.
-So the Blackwell at concurrency 1 holds 3 and the 4090 at concurrency 2 holds 2.
+So the Pro 4000 at concurrency 1 holds 3 and the 4090 at concurrency 2 holds 2.
 
 ### The two forks retain differently
 
 They are different engine lineages, and it changes how many conversations each
-card keeps warm. The Blackwell fork has a cost-model driven context cache
+card keeps warm. The Pro 4000 fork has a cost-model driven context cache
 (`src/runtime/engine/context_cost.cpp`, about 9600 lines in `runtime/engine`)
 and holds two private continuations plus one shared prefix at concurrency 1.
 The 4090 fork has no such cache: reuse is per lane, against the sequence that
@@ -111,7 +112,7 @@ the retention it was meant to fix is a concurrency setting instead.
 Both cards in the configuration their launch scripts use, meaning
 `--spec mtp --draft-tokens 3 --lm-head-draft` on both.
 
-| | Blackwell nvfp4 | RTX 4090 int |
+| | Pro 4000 nvfp4 | RTX 4090 int |
 |---|---|---|
 | decode, mean of 4 prompts | 57.4 tok/s (50.9 to 65.2) | **108.0 tok/s** (94.5 to 124.2) |
 | decode, speculation off | 29.7 tok/s (29.3 to 29.9) | not measured |
@@ -126,19 +127,19 @@ Both cards in the configuration their launch scripts use, meaning
 `prefill` alone is not enough at long lengths. Fitting `t/prefill + attn * t^2`
 reproduces every point above 30k within 0.2%, while a flat rate tuned to the
 short end underestimates a 63k prompt by 28%. The 4090 has the smaller attention
-coefficient, so the Blackwell's prefill lead narrows with length: 1.66x at 2.4k,
+coefficient, so the Pro 4000's prefill lead narrows with length: 1.66x at 2.4k,
 1.55x at 32k, 1.38x at 63k.
 
 ### The resulting shape rule
 
-For a cold request the Blackwell wins when the prompt is more than about 40
+For a cold request the Pro 4000 wins when the prompt is more than about 40
 times the generation, near enough flat across the range (38 at 1k, 44 at 32k,
 57 at the 81920 ceiling). Worked examples:
 
-| shape | Blackwell | 4090 | winner |
+| shape | Pro 4000 | 4090 | winner |
 |---|---|---|---|
-| 32k document, 200 token answer | 14.35 s | 18.67 s | Blackwell |
-| 63k document, 400 token answer | 33.17 s | 39.89 s | Blackwell |
+| 32k document, 200 token answer | 14.35 s | 18.67 s | Pro 4000 |
+| 63k document, 400 token answer | 33.17 s | 39.89 s | Pro 4000 |
 | 16k code review, 800 tokens out | 18.85 s | 15.59 s | 4090 |
 | 800 token chat turn, 300 out | 5.44 s | 3.16 s | 4090 |
 | short prompt, 2000 token essay | 34.97 s | 18.76 s | 4090 |
@@ -148,7 +149,7 @@ This only applies to cold requests. A warm prefix on the other card overrides it
 ## Calibrating a backend
 
     python3 tools/router/shape_bench.py --server http://127.0.0.1:8080 \
-        --label blackwell --out bw.json --max-context 81920 --repeat 1 \
+        --label pro4000 --out bw.json --max-context 81920 --repeat 1 \
         --prompts models/retrieval_spot.json models/long_prompt_32tok.json \
                   models/long_prompt_64tok.json
 
@@ -191,23 +192,23 @@ cold caches; without that the policies run in order and each is warmed by the
 last, which silently flatters whichever runs last.
 
     python3 tools/router/live_bench.py \
-        --blackwell http://127.0.0.1:8080 --rtx4090 http://127.0.0.1:8081 \
+        --pro4000 http://127.0.0.1:8080 --rtx4090 http://127.0.0.1:8081 \
         --endpoint /v1/chat/completions
 
 Mean time to first token, seconds:
 
-| trace | blackwell | rtx4090 | round robin | router |
+| trace | pro4000 | rtx4090 | round robin | router |
 |---|---|---|---|---|
 | 1 cold 32k prefill then 6 short calls | 12.19 | 17.15 | 6.52 | **1.82** |
 | 2 documents of 32k, 8 bunched turns | 21.60 | 55.59 | 23.94 | **14.58** |
 | 2 documents of 2.4k, 8 bunched turns | 4.18 | 4.64 | **1.92** | 1.94 |
 
 The first row is head of line blocking: the router placed the long prefill on
-the Blackwell and all six short calls on the 4090, for a median of 0.29 seconds
+the Pro 4000 and all six short calls on the 4090, for a median of 0.29 seconds
 against round robin's 10.94.
 
 The second is affinity. Each card took one document and hit cache on all three
-follow ups, and round robin came out **worse than the Blackwell alone**, because
+follow ups, and round robin came out **worse than the Pro 4000 alone**, because
 it splits each conversation across both cards and destroys the affinity a single
 card gets for free. That failure mode is why the router leads with affinity
 rather than load.
@@ -228,7 +229,7 @@ than one request at a time. It was measured, and it does not substitute.
 
 Both servers run `--max-concurrency 1`. Raising it costs context, because the
 context-cache capacities scale off it: the CUDA graph allowance alone doubles
-from 82 to 164 MiB. Measured on the Blackwell with vision and MTP3, on an 8192
+from 82 to 164 MiB. Measured on the Pro 4000 with vision and MTP3, on an 8192
 step grid:
 
 | concurrency | ceiling | `serve.sh` default | 1 stream | loaded per-stream | aggregate decode | 8 short calls |
@@ -302,6 +303,6 @@ prefixes only. A client that rewrites earlier turns loses its affinity, which is
 correct, because the server's cache would miss too.
 
 `affinity_min_tokens` is a measured floor, not a policy, and it moves. With the
-context cost presets calibrated, cycling two prompts on the Blackwell retained
+context cost presets calibrated, cycling two prompts on the Pro 4000 retained
 nothing at 349 tokens, a third of the time at 949, half at 1949, and every time
 at 3943 and above. Re-measure after changing `--max-concurrency` or the presets.

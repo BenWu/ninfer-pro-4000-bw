@@ -7,6 +7,7 @@ are not holding the same model.
 """
 import json
 import socket
+import struct
 import sys
 import threading
 import time
@@ -86,7 +87,7 @@ def test_client_disconnect_frees_the_backend():
                 b"content-length: %d\r\n\r\n" % len(body) + body)
     time.sleep(0.5)
     raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                   __import__("struct").pack("ii", 1, 0))   # RST rather than FIN
+                   struct.pack("ii", 1, 0))   # RST rather than FIN
     raw.close()
 
     # The backend must become reusable rather than staying locked forever.
@@ -197,14 +198,14 @@ def test_midstream_failure_is_not_retried():
 
 
 def test_affinity_slots_follow_concurrency():
-    blackwell = ninfer_router.Backend("bw", "http://x", 98304, 3860, 57.4,
+    pro4000 = ninfer_router.Backend("bw", "http://x", 98304, 3860, 57.4,
                                       concurrency=1, slots_per_lane=3)
-    check("Blackwell at concurrency 1 gets 3 slots", blackwell.affinity_slots == 3,
-          f"got {blackwell.affinity_slots}")
-    blackwell2 = ninfer_router.Backend("bw2", "http://x", 73728, 3860, 57.4,
+    check("Pro 4000 at concurrency 1 gets 3 slots", pro4000.affinity_slots == 3,
+          f"got {pro4000.affinity_slots}")
+    pro4000_2 = ninfer_router.Backend("bw2", "http://x", 73728, 3860, 57.4,
                                        concurrency=2, slots_per_lane=3)
-    check("Blackwell at concurrency 2 gets 6 slots", blackwell2.affinity_slots == 6,
-          f"got {blackwell2.affinity_slots}")
+    check("Pro 4000 at concurrency 2 gets 6 slots", pro4000_2.affinity_slots == 6,
+          f"got {pro4000_2.affinity_slots}")
     gpu = ninfer_router.Backend("4090", "http://x", 262144, 2115, 108.0,
                                 concurrency=2, slots_per_lane=1)
     check("the 4090 at concurrency 2 gets 2 slots", gpu.affinity_slots == 2,

@@ -164,7 +164,7 @@ def test_failover_to_a_live_backend():
 
     # It comes back, and a probe restores it.
     mock_backend.serve(9598, 3000, 60, 200000, 400.0)
-    router.probe_unhealthy()
+    router.probe_all()
     check("a backend that comes back is restored", dead.healthy is True,
           "still marked unreachable")
     server.shutdown()
@@ -313,9 +313,48 @@ def test_vision_routing_when_only_vision_backend_is_down():
     server.server_close()
 
 
+def test_healthy_backend_is_proactively_taken_down():
+    # A currently-healthy backend that dies between requests must be pulled out
+    # by the periodic probe alone, without any request having failed into it.
+    dead_port, good_port = 9512, 9513
+    dead_server, _ = mock_backend.serve(dead_port, 3000, 60, 200000, 400.0)
+    mock_backend.serve(good_port, 3000, 60, 200000, 400.0)
+    dead = ninfer_router.Backend("dead", f"http://127.0.0.1:{dead_port}", 200000, 3000, 60)
+    good = ninfer_router.Backend("good", f"http://127.0.0.1:{good_port}", 200000, 3000, 60)
+    router = ninfer_router.Router([dead, good], lambda line: None)
+
+    check("a fresh backend starts healthy", dead.healthy is True)
+
+    # Kill it. No request has failed into it, so the reactive path never fires.
+    dead_server.shutdown()
+    dead_server.server_close()
+
+    # One missed probe is not enough: the threshold keeps a single slow probe
+    # from flapping a busy card out of rotation.
+    router.probe_all()
+    check("one missed probe does not take a healthy backend down",
+          dead.healthy is True, "flapped down on a single probe")
+
+    # The second consecutive miss crosses the threshold.
+    router.probe_all()
+    check("a healthy backend is pulled out after the threshold misses",
+          dead.healthy is False, "still in rotation")
+    check("the threshold does not touch a backend that is answering",
+          good.healthy is True, "live backend wrongly taken down")
+
+    # It comes back and one successful probe restores it.
+    dead_server, _ = mock_backend.serve(dead_port, 3000, 60, 200000, 400.0)
+    router.probe_all()
+    check("a proactively-down backend is restored when it answers",
+          dead.healthy is True, "still marked unreachable")
+    dead_server.shutdown()
+    dead_server.server_close()
+
+
 def main():
     print("failure and identity behaviour")
     test_failed_request_forgets_affinity()
+    test_healthy_backend_is_proactively_taken_down()
     test_client_disconnect_frees_the_backend()
     test_mismatched_models_are_refused()
     test_failover_to_a_live_backend()

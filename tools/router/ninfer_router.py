@@ -64,8 +64,15 @@ DEFAULT_MAX_TOKENS = 8192
 # concurrency to match the server and slots_per_lane to match its fork.
 SLOTS_PER_LANE = 3
 
-# How often to re-probe a backend that stopped answering.
+# How often to poll every backend: to restore one that has started answering
+# again, and to detect a healthy one that has stopped.
 HEALTH_PROBE_SECONDS = 5.0
+
+# Consecutive missed probes before a currently healthy backend is pulled out of
+# rotation. /health is a static handler, but a card mid a long generation can
+# answer it late, so a single dropped probe is not evidence of a restart. Two
+# consecutive misses at the 5s cadence is.
+HEALTH_DOWN_THRESHOLD = 2
 
 # Retention is a cost model decision inside the engine, not a fixed rule, so this
 # is a measured floor rather than a policy. Cycling two prompts on the Pro 4000
@@ -103,6 +110,10 @@ class Backend:
         # Set false when the backend stops answering, so a restart takes it out
         # of rotation instead of failing one request after another into it.
         self.healthy = True
+        # Consecutive missed /health probes. The periodic probe increments it on
+        # a miss and clears it on a hit; a healthy backend is pulled out once it
+        # reaches HEALTH_DOWN_THRESHOLD, so one slow probe cannot flap it.
+        self.failure_streak = 0
         # Estimated work already committed to this backend. Counting jobs and
         # multiplying by an average badly misprices a queue whose jobs differ by
         # more than an order of magnitude, which is exactly the traffic here:
@@ -374,16 +385,24 @@ class Router:
                 backend.healthy = healthy
                 self.log(f"{backend.name} is now {'up' if healthy else 'unreachable'}")
 
-    def probe_unhealthy(self):
-        """Restore backends that have started answering again."""
+    def probe_all(self):
+        """Poll every backend, healthy or not.
+
+        Restores a backend that has started answering again, and pulls a
+        currently healthy one out after HEALTH_DOWN_THRESHOLD consecutive
+        missed probes. Polling the healthy ones too is what catches a card that
+        dies or wedges between requests while traffic is flowing only to the
+        other one, instead of waiting for the next request to fail into it.
+        """
         for backend in self.backends:
-            if backend.healthy:
-                continue
             try:
                 with urllib.request.urlopen(backend.url + "/health", timeout=2):
+                    backend.failure_streak = 0
                     self.mark(backend, True)
             except Exception:
-                pass
+                backend.failure_streak += 1
+                if backend.healthy and backend.failure_streak >= HEALTH_DOWN_THRESHOLD:
+                    self.mark(backend, False)
 
     def snapshot(self):
         with self.lock:
@@ -566,6 +585,13 @@ class Handler(BaseHTTPRequestHandler):
             return "retry", exc
 
         self.router.mark(backend, True)
+        # A successful request is definitive liveness evidence, so clear any
+        # stale probe-miss streak. Without this a backend that the probe had
+        # taken down, then a request recovered, could carry streak >= 2 into a
+        # healthy state and be pulled out again by a single slow probe -- which
+        # is exactly the flap the threshold is meant to prevent. Only the probe
+        # thread reads the counter, so this unlocked write is race-free.
+        backend.failure_streak = 0
         with upstream:
             return ("ok", None) if self._relay(upstream) else ("client-gone", None)
 
@@ -650,7 +676,7 @@ def main():
     def probe_forever():
         while True:
             time.sleep(HEALTH_PROBE_SECONDS)
-            router.probe_unhealthy()
+            router.probe_all()
 
     threading.Thread(target=probe_forever, daemon=True).start()
     Handler.router = router

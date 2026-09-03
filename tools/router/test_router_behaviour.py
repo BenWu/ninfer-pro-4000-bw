@@ -216,6 +216,103 @@ def test_affinity_slots_follow_concurrency():
           f"got {override.affinity_slots}")
 
 
+def test_vision_requests_exclude_non_vision_backends():
+    """A request carrying images must never land on a backend with vision=0."""
+    port = 9520
+    mock_backend.serve(port, 3000, 60, 200000, 400.0)
+    no_vision = ninfer_router.Backend("no_vision", f"http://127.0.0.1:{port}",
+                                      200000, 3000, 60, vision=False)
+    with_vision = ninfer_router.Backend("with_vision", f"http://127.0.0.1:{port}",
+                                        200000, 3000, 60, vision=True)
+    server, router = start_router(9521, [no_vision, with_vision])
+
+    # Vision request: OpenAI image_url part.
+    vision_body = {"model": "m", "max_tokens": 16,
+                   "messages": [{"role": "user",
+                                 "content": [
+                                     {"type": "text", "text": "what is this?"},
+                                     {"type": "image_url",
+                                      "image_url": {"url": "data:image/png;base64,AAAA"}}]}]}
+    urllib.request.urlopen(urllib.request.Request(
+        "http://127.0.0.1:9521/v1/chat/completions",
+        data=json.dumps(vision_body).encode(),
+        headers={"content-type": "application/json"}), timeout=30).read()
+
+    check("a vision request is not routed to a vision=0 backend",
+          no_vision.queued == 0 and no_vision.stats.get("cold-idle", 0) == 0,
+          f"no_vision queued={no_vision.queued} stats={dict(no_vision.stats)}")
+    check("a vision request lands on a vision=1 backend",
+          with_vision.queued == 0 and sum(with_vision.stats.values()) == 1,
+          f"with_vision stats={dict(with_vision.stats)}")
+
+    # Non-vision request: should be eligible for both backends.
+    text_body = {"model": "m", "max_tokens": 16,
+                 "messages": [{"role": "user", "content": "hello"}]}
+    urllib.request.urlopen(urllib.request.Request(
+        "http://127.0.0.1:9521/v1/chat/completions",
+        data=json.dumps(text_body).encode(),
+        headers={"content-type": "application/json"}), timeout=30).read()
+
+    check("a text-only request may still use either backend",
+          sum(no_vision.stats.values()) + sum(with_vision.stats.values()) == 2,
+          f"no_vision={dict(no_vision.stats)} with_vision={dict(with_vision.stats)}")
+
+    # Vision request with Anthropic image part shape.
+    anthropic_vision = {"model": "m", "max_tokens": 16,
+                        "messages": [{"role": "user",
+                                      "content": [
+                                          {"type": "text", "text": "describe"},
+                                          {"type": "image",
+                                           "source": {"type": "base64",
+                                                      "media_type": "image/png",
+                                                      "data": "AAAA"}}]}]}
+    urllib.request.urlopen(urllib.request.Request(
+        "http://127.0.0.1:9521/v1/messages",
+        data=json.dumps(anthropic_vision).encode(),
+        headers={"content-type": "application/json", "anthropic-version": "2023-06-01"}),
+        timeout=30).read()
+
+    check("an Anthropic image request is also excluded from vision=0",
+          no_vision.queued == 0,
+          f"no_vision queued={no_vision.queued} stats={dict(no_vision.stats)}")
+
+    server.shutdown()
+    server.server_close()
+
+
+def test_vision_routing_when_only_vision_backend_is_down():
+    """If the only vision-capable backend is down, a vision request fails
+    rather than being sent to a backend that will reject it."""
+    port = 9522
+    mock_backend.serve(port, 3000, 60, 200000, 400.0)
+    good = ninfer_router.Backend("good", f"http://127.0.0.1:{port}",
+                                 200000, 3000, 60, vision=True)
+    dead_visionless = ninfer_router.Backend("dead_nv",
+                                            "http://127.0.0.1:9599",
+                                            200000, 3000, 60, vision=False)
+    server, router = start_router(9523, [dead_visionless, good])
+
+    vision_body = {"model": "m", "max_tokens": 16,
+                   "messages": [{"role": "user",
+                                 "content": [{"type": "text", "text": "hi"},
+                                             {"type": "image_url",
+                                              "image_url": {"url": "data:image/png;base64,x"}}]}]}
+    try:
+        urllib.request.urlopen(urllib.request.Request(
+            "http://127.0.0.1:9523/v1/chat/completions",
+            data=json.dumps(vision_body).encode(),
+            headers={"content-type": "application/json"}), timeout=30).read()
+        ok = True
+    except Exception:
+        ok = False
+    check("a vision request succeeds when the vision backend is up", ok)
+    check("the visionless backend was never touched for a vision request",
+          sum(dead_visionless.stats.values()) == 0,
+          f"stats={dict(dead_visionless.stats)}")
+    server.shutdown()
+    server.server_close()
+
+
 def main():
     print("failure and identity behaviour")
     test_failed_request_forgets_affinity()
@@ -224,6 +321,8 @@ def main():
     test_failover_to_a_live_backend()
     test_midstream_failure_is_not_retried()
     test_affinity_slots_follow_concurrency()
+    test_vision_requests_exclude_non_vision_backends()
+    test_vision_routing_when_only_vision_backend_is_down()
     if FAILURES:
         print(f"\nFAIL: {len(FAILURES)} check(s) failed")
         return 1

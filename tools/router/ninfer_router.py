@@ -79,7 +79,8 @@ AFFINITY_MIN_TOKENS = 2048
 class Backend:
     def __init__(self, name, url, max_context, prefill_tok_s, decode_tok_s,
                  affinity_min_tokens=AFFINITY_MIN_TOKENS, attention_s_per_token2=0.0,
-                 affinity_slots=None, concurrency=1, slots_per_lane=SLOTS_PER_LANE):
+                 affinity_slots=None, concurrency=1, slots_per_lane=SLOTS_PER_LANE,
+                 vision=True):
         self.name = name
         self.url = url.rstrip("/")
         self.max_context = max_context
@@ -106,6 +107,9 @@ class Backend:
         # more than an order of magnitude, which is exactly the traffic here:
         # a cold 30k prefill and a chat turn are not interchangeable units.
         self.pending_seconds = 0.0
+        # Vision capability: a backend running with vision disabled rejects
+        # image content, so the router must not send it such a request.
+        self.vision = vision
 
     def remember(self, hashes):
         """Record what this backend will hold once the request completes.
@@ -205,6 +209,18 @@ GENERATING_ENDPOINTS = {
 }
 
 
+def has_vision(request):
+    """True if any message in the request carries image content."""
+    for message in request["messages"]:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("image_url", "image", "input_image"):
+                return True
+    return False
+
+
 def message_tokens(message):
     """Rough token size of one message, counting images flat rather than by text."""
     content = message.get("content")
@@ -261,9 +277,14 @@ class Router:
         prompt_tokens = estimate_prompt_tokens(request)
         output_tokens = request["max_tokens"] or DEFAULT_MAX_TOKENS
         hashes = prefix_hashes(request["preamble"], request["system"], request["messages"])
+        needs_vision = has_vision(request)
 
         with self.lock:
             usable = [b for b in self.backends if b not in exclude]
+            if needs_vision:
+                # A backend running without vision will reject image content,
+                # so the only legal placements are the ones that can handle it.
+                usable = [b for b in usable if b.vision]
             # Prefer backends that are answering, but if none are, try anyway
             # rather than refusing: a probe may simply not have caught up yet.
             answering = [b for b in usable if b.healthy]
@@ -369,6 +390,7 @@ class Router:
                              "pending_seconds": round(b.pending_seconds, 3),
                              "max_context": b.max_context,
                              "warm_prefixes": f"{len(b.prefixes)}/{b.affinity_slots}",
+                             "vision": b.vision,
                              "healthy": b.healthy,
                              "routed": dict(b.stats)} for b in self.backends}
 
@@ -565,7 +587,8 @@ def parse_backend(spec):
                    float(opts.get("attn", 0.0)),
                    int(opts["affinity_slots"]) if "affinity_slots" in opts else None,
                    int(opts.get("concurrency", 1)),
-                   int(opts.get("slots_per_lane", SLOTS_PER_LANE)))
+                   int(opts.get("slots_per_lane", SLOTS_PER_LANE)),
+                   vision=(opts.get("vision", "1") != "0"))
 
 
 def backend_model_id(backend, timeout=5):
@@ -608,7 +631,9 @@ def main():
     ap.add_argument("--backend", action="append", required=True,
                     help="name=url[,max_context=N][,prefill=tok/s][,decode=tok/s]"
                          "[,attn=s_per_token_squared][,affinity_min_tokens=N]"
-                         "[,concurrency=N][,slots_per_lane=N][,affinity_slots=N]")
+                         "[,concurrency=N][,slots_per_lane=N][,affinity_slots=N]"
+                         "[,vision=0|1] (default 1; set vision=0 on a backend "
+                         "running without vision so image requests exclude it)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
